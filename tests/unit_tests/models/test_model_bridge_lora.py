@@ -1090,3 +1090,81 @@ def test_column_parallel_mapping_skips_ep_gather_for_adapters(monkeypatch):
 
     result = mapping.megatron_to_hf(torch.ones(2, 2), None)
     torch.testing.assert_close(result["hf_param"], torch.ones(2, 2))
+
+
+def test_grouped_export_merges_adapter_into_stacked_tensor(monkeypatch):
+    """A LoRA on a fused-expert (is_grouped_export) weight must reach the exported tensor.
+
+    The grouped path accumulates one expert per task and stacks them; if the adapter is not
+    merged before accumulation it is dropped silently, because the stacked base tensor still
+    has the shape HF expects.
+    """
+    from megatron.bridge.models.conversion import model_bridge as mb
+
+    bridge = DummyBridge()
+    group_key = "model.layers.0.mlp.experts.down_proj.weight"
+    num_experts = 2
+
+    def _make_task(expert_idx):
+        name = f"decoder.layers.0.mlp.experts.local_experts.{expert_idx}.linear_fc2.to_wrap.weight"
+        mapping = SimpleNamespace(
+            is_grouped_export=True,
+            group_key=group_key,
+            transpose_on_export=False,
+            megatron_to_hf=lambda w, m: {group_key: torch.zeros(2, 2)},
+        )
+        return SimpleNamespace(
+            mapping=mapping,
+            param_name=name,
+            global_param_name=name,
+            param_weight=torch.zeros(2, 2),
+            megatron_module=None,
+        )
+
+    tasks = [_make_task(i) for i in range(num_experts)]
+    base_prefix = "decoder.layers.0.mlp.experts.local_experts.0.linear_fc2"
+
+    adapter_weight = AdapterWeight(
+        global_base_prefix=base_prefix,
+        adapter_key=None,
+        alpha=2,
+        dim=2,
+        linear_in_weight=MegatronWeightTuple("in", torch.eye(2), vp_stage=0),
+        linear_out_weight=MegatronWeightTuple("out", 2 * torch.eye(2), vp_stage=0),
+    )
+
+    model = SimpleNamespace(config=SimpleNamespace(num_moe_experts=num_experts))
+    monkeypatch.setattr(mb, "unwrap_model", lambda m: [model])
+    monkeypatch.setattr(
+        mb.parallel_state, "get_expert_model_parallel_world_size", lambda: 1, raising=False
+    )
+    monkeypatch.setattr(bridge, "_share_embeddings_and_output_weights", lambda cfg: False)
+    monkeypatch.setattr(
+        bridge,
+        "build_adapter_conversion_tasks",
+        lambda m: {
+            f"decoder.layers.0.mlp.experts.local_experts.{i}.linear_fc2": [object()]
+            for i in range(num_experts)
+        },
+    )
+    monkeypatch.setattr(bridge, "materialize_adapter_weights", lambda tasks_: [adapter_weight])
+    monkeypatch.setattr(bridge, "_should_skip_mtp_duplicate_embedding_export", lambda t, m: False)
+
+    out = list(
+        bridge.stream_weights_megatron_to_hf(
+            [model],
+            SimpleNamespace(state={}),
+            cpu=True,
+            show_progress=False,
+            conversion_tasks=tasks,
+            merge_adapter_weights=True,
+        )
+    )
+
+    assert len(out) == 1, f"expected one stacked tensor, got {[n for n, _ in out]}"
+    name, tensor = out[0]
+    assert name == group_key
+    assert tuple(tensor.shape) == (num_experts, 2, 2)
+    # base is zeros; delta = (alpha/dim) * out @ in = (2/2) * 2I @ I = 2I
+    expected = (2 * torch.eye(2)).expand(num_experts, 2, 2)
+    torch.testing.assert_close(tensor, expected.contiguous())

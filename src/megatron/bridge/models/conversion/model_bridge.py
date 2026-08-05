@@ -1140,6 +1140,21 @@ class MegatronModelBridge(MegatronPeftBridge, Generic[HFPreTrained, ModelProvide
 
             # --- Grouped export path: accumulate per-expert weights, yield when complete ---
             if getattr(task.mapping, "is_grouped_export", False):
+                # Merge here rather than after accumulation: each grouped task carries a single
+                # expert's weight together with that expert's adapter, and _accumulate_grouped_export
+                # stacks the experts into one tensor keyed by group_key, at which point the
+                # per-expert adapter can no longer be matched to its slice. Skipping this merge
+                # drops the adapter from the export silently, since the stacked base tensor is
+                # still the right shape.
+                if merge_adapter_weights and "to_wrap.weight" in task.global_param_name:
+                    grouped_base_prefix, _, _ = task.global_param_name.partition(".to_wrap.weight")
+                    grouped_adapter_tasks = adapter_tasks_by_base.get(grouped_base_prefix)
+                    if grouped_adapter_tasks:
+                        converted_weights_dict = self._merge_lora_adapter_weights(
+                            megatron_model,
+                            converted_weights_dict,
+                            self.materialize_adapter_weights(grouped_adapter_tasks),
+                        )
                 merged_result = self._accumulate_grouped_export(
                     task, converted_weights_dict, model_config, _grouped_buffers, hf_state_dict
                 )
