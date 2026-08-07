@@ -28,6 +28,7 @@ from megatron.core.utils import get_pg_rank, unwrap_model
 
 from megatron.bridge.models.conversion.param_mapping import (
     ColumnParallelMapping,
+    MambaInProjMapping,
     ReplicatedMapping,
     RowParallelMapping,
     _split_gdn_grouped_to_separate,
@@ -660,7 +661,18 @@ class MegatronPeftBridge:
             # Pick mapping strategies based on base layer parallelism
             if base_linear_is_parallel:
                 linear_in_mapping_cls = RowParallelMapping if input_is_parallel else ColumnParallelMapping
-                linear_out_mapping_cls = ColumnParallelMapping
+                # linear_out must gather the same way as the base weight its delta
+                # merges into. Mamba in_proj gathers component-major (z/x/B/C/dt
+                # each gathered across TP ranks, then concatenated), so take the
+                # mapping from the base rather than assuming column-parallel.
+                # Keyed on the mapping type, not the parameter name: GDN's
+                # self_attention.in_proj de-interleaves in its own merge branch and
+                # wants the column-parallel mapping.
+                base_mapping = mapping_registry.megatron_to_hf_lookup(f"{global_base_prefix}{base_suffix}")
+                if isinstance(base_mapping, MambaInProjMapping):
+                    linear_out_mapping_cls = MambaInProjMapping
+                else:
+                    linear_out_mapping_cls = ColumnParallelMapping
             else:
                 linear_in_mapping_cls = ReplicatedMapping
                 linear_out_mapping_cls = ReplicatedMapping
