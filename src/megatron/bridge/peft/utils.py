@@ -25,7 +25,9 @@ from megatron.core import ModelParallelConfig, parallel_state
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict, ShardedTensor
 from megatron.core.tensor_parallel import ColumnParallelLinear, RowParallelLinear
 from megatron.core.tensor_parallel.mappings import (
+    copy_to_tensor_model_parallel_region,
     gather_from_sequence_parallel_region,
+    reduce_from_tensor_model_parallel_region,
     scatter_to_sequence_parallel_region,
 )
 from megatron.core.transformer.mlp import apply_swiglu_sharded_factory
@@ -296,9 +298,12 @@ def pad_seq_to_mult(x: torch.Tensor, mult: int) -> Tuple[torch.Tensor, int]:
     if x.shape[0] % mult == 0:
         return x, 0
     pad_len = mult - (x.shape[0] % mult)
-    with torch.no_grad():
-        # pad at the tail
-        x = nn.functional.pad(x, (0, 0, 0, pad_len))
+    # Both this pad and the matching unpad stay inside the autograd graph. They sit on the
+    # adapter's own activation path, and unpad is the last op in ParallelLinearAdapter.forward
+    # whenever pad_len > 0 -- detaching there severs the adapter from the graph entirely, so
+    # the delta still perturbs the forward while dL/dA and dL/dB are exactly zero. Silent, and
+    # routine at ETP > 1, where a per-expert token count is divisible by ETP only by luck.
+    x = nn.functional.pad(x, (0, 0, 0, pad_len))
     return x, pad_len
 
 
@@ -314,9 +319,7 @@ def unpad_seq_to_mult(x: torch.Tensor, pad_len: int) -> torch.Tensor:
     """
     if pad_len <= 0:
         return x
-    with torch.no_grad():
-        # prune tail padding
-        return x[:-pad_len, :]
+    return x[:-pad_len, :]
 
 
 class _All2AllHp2Sp(torch.autograd.Function):
@@ -517,6 +520,26 @@ class ParallelLinearAdapter(nn.Module):
         if not base_linear_is_parallel:
             lin_out_gather_output = True
 
+        # EXPERT_ROW_PARALLEL_ADAPTER_FIX
+        #
+        # An expert linear whose input is already sharded (experts.linear_fc2) emits a partial
+        # that the MoE token dispatcher sums across the expert-tensor-parallel group. Gathering
+        # here would hand every rank the same full-width delta, and that sum would then count it
+        # once per rank. Keep the shard instead and zero-embed it into full width in forward():
+        # each output element is then contributed by exactly one rank, so the dispatcher's sum
+        # reconstructs B@z once, with no scaling to get wrong and no collective on this path.
+        # The embedding's adjoint is a slice, so dL/dB_r is the plain local term.
+        self._expert_row_parallel = bool(is_expert and input_is_parallel)
+        if self._expert_row_parallel:
+            if self.use_a2a and _sequence_parallel:
+                raise ValueError(
+                    "a2a_experimental with sequence parallelism is not supported for expert "
+                    "row-parallel adapters: forward() skips the all-to-all block for experts, "
+                    "so the adapter output would keep a hidden-sharded layout the base's "
+                    "full-width partial cannot absorb."
+                )
+            lin_out_gather_output = False
+
         self.linear_out = ColumnParallelLinear(
             dim,
             out_features,
@@ -594,6 +617,63 @@ class ParallelLinearAdapter(nn.Module):
             raise NotImplementedError("out_init_method should be zero, normal, kaiming or xavier")
         return init_fn
 
+    def _reduce_expert_low_rank_activation(self, x: torch.Tensor) -> torch.Tensor:
+        """Complete `A @ h` across the expert-tensor-parallel group, in both directions.
+
+        Megatron suppresses an expert linear's own collectives -- `explicit_expert_comm` is
+        true for any `is_expert` layer once the ETP group is larger than one rank -- because
+        for the BASE layers the MoE token dispatcher owns that communication. An adapter is
+        not routed through the dispatcher the same way, so what the suppression leaves behind
+        is arithmetically incomplete on both passes:
+
+        - `input_is_parallel` (experts.linear_fc2): `linear_in` is row-parallel, so `A_r @ h_r`
+          is a per-rank partial that is never summed. `B @ A @ h` is then not computed at all,
+          and no merged weight can express what the trainer runs.
+        - otherwise (experts.linear_fc1): `linear_in` is column-parallel and its all-gather is
+          not suppressed, so the forward is already right -- but the gather's adjoint is a
+          split, and `explicit_expert_comm` also forces `allreduce_dgrad=False`, which is what
+          a non-expert column-parallel layer relies on to sum `dL/dz` across ranks. Rank r
+          therefore sees only its own `B_r^T g_r` and `dL/dA_r` loses every cross-rank term.
+
+        Hence two different compositions, not one. `copy_to` is forward-identity with a
+        backward all-reduce; `reduce_from` is a forward all-reduce with backward identity.
+        Composing them gives all-reduce on BOTH passes, which is the true adjoint pair for a
+        sum whose result every rank consumes differently. A bare `torch.distributed.all_reduce`
+        would be wrong twice over: invisible to autograd, and an in-place write on a graph
+        tensor.
+        """
+        if not self.is_expert:
+            return x
+        etp_size = parallel_state.get_expert_tensor_parallel_world_size()
+        if etp_size <= 1:
+            return x
+        etp_group = parallel_state.get_expert_tensor_parallel_group()
+        if self.input_is_parallel:
+            return reduce_from_tensor_model_parallel_region(
+                copy_to_tensor_model_parallel_region(x, etp_group), etp_group
+            )
+        return copy_to_tensor_model_parallel_region(x, etp_group)
+
+    def _embed_expert_row_parallel_shard(self, x: torch.Tensor) -> torch.Tensor:
+        """Place this rank's hidden shard into a full-width buffer of zeros.
+
+        The base emits a full-width partial and the dispatcher sums those across ETP, so the
+        adapter has to contribute in the same currency. Zero-padding rather than gathering
+        means each output element has exactly one non-zero contributor, so the sum that
+        follows reproduces `B @ z` once -- no `1/ETP` factor to derive, and nothing to
+        re-derive if the dispatcher's reduction changes shape. Padding is differentiable and
+        its adjoint is the matching slice, so `dL/dB_r` needs no compensation either.
+        """
+        if not self._expert_row_parallel:
+            return x
+        etp_size = parallel_state.get_expert_tensor_parallel_world_size()
+        if etp_size <= 1:
+            return x
+        shard_width = x.shape[-1]
+        left = parallel_state.get_expert_tensor_parallel_rank() * shard_width
+        right = (etp_size - 1) * shard_width - left
+        return nn.functional.pad(x, (left, right))
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Forward pass of the parallel linear adapter.
 
@@ -624,11 +704,15 @@ class ParallelLinearAdapter(nn.Module):
             x.activation_offloading = True
         x, _ = self.linear_in(x)  # (@adithyare) ColumnLinear returns output and bias, we are ignoring the bias term.
 
+        x = self._reduce_expert_low_rank_activation(x)
+
         x = self.activation(x)
 
         if self.config.cpu_offloading and self.config.cpu_offloading_activations:
             x.activation_offloading = True
         x, _ = self.linear_out(x)
+
+        x = self._embed_expert_row_parallel_shard(x)
 
         if not self.disable_sequence_parallel_comm and self.input_is_parallel and not self.is_expert:
             # for attention_dense and linear_fc2
