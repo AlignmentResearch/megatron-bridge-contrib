@@ -529,7 +529,14 @@ class ParallelLinearAdapter(nn.Module):
         # each output element is then contributed by exactly one rank, so the dispatcher's sum
         # reconstructs B@z once, with no scaling to get wrong and no collective on this path.
         # The embedding's adjoint is a slice, so dL/dB_r is the plain local term.
-        self._expert_row_parallel = bool(is_expert and input_is_parallel)
+        #
+        # `base_linear_is_parallel` is part of the predicate, not an accident: a replicated base
+        # holds the whole weight on every rank and no dispatcher sums its output, so there is no
+        # shard to embed and gathering remains right. Overriding it here would emit a delta that
+        # is three-quarters zeros at ETP=4.
+        self._expert_row_parallel = bool(
+            is_expert and input_is_parallel and base_linear_is_parallel
+        )
         if self._expert_row_parallel:
             if self.use_a2a and _sequence_parallel:
                 raise ValueError(
