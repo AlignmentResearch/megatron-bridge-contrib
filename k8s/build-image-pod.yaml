@@ -1,6 +1,6 @@
 # Ephemeral builder Job for docker/Dockerfile.ci on the FAR.AI "flamingo" cluster.
 #
-# Created and torn down by tools/build_image_on_flamingo.sh (invoked by `make image-remote`).
+# Created and torn down by tools/build_image_on_flamingo.sh (invoked by `make image-build-remote`).
 # The buildkitd service (buildkitd.buildkitd.svc.cluster.local:1234) is only reachable from
 # inside the cluster, so the build must run from a pod. This container just sleeps; the script
 # syncs the working tree into it, then execs `docker buildx build --push` against the shared
@@ -20,15 +20,27 @@ metadata:
   name: __JOB_NAME__
   labels:
     kueue.x-k8s.io/queue-name: farai
+    app.kubernetes.io/name: megatron-bridge-image-build
+    app.kubernetes.io/component: local-dev
+    user: __USER_LABEL__
+    megatron-bridge.farai/user: __USER_LABEL__
 spec:
   backoffLimit: 0
   suspend: true                  # kueue unsuspends on admission
+  # Builds run DETACHED on the pod, so this is the backstop that reclaims an abandoned build (the
+  # container sleeps indefinitely and the launching shell may be long gone). ~4h comfortably covers
+  # a ~90 min cold build.
+  activeDeadlineSeconds: 14400
   ttlSecondsAfterFinished: 600   # backstop cleanup if the script can't delete it
   template:
     metadata:
       name: __JOB_NAME__
       labels:
         kueue.x-k8s.io/queue-name: farai
+        app.kubernetes.io/name: megatron-bridge-image-build
+        app.kubernetes.io/component: local-dev
+        user: __USER_LABEL__
+        megatron-bridge.farai/user: __USER_LABEL__
     spec:
       restartPolicy: Never
       priorityClassName: __PRIORITY__

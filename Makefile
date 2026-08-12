@@ -2,17 +2,18 @@
 #   1. Docs:    build the upstream Sphinx site (docs-html / docs-live / docs-clean).
 #   2. Tests:   run the unit-test suites that FAR.AI CI gates on (test-unit family).
 #   3. Image:   build docker/Dockerfile.ci and push ghcr.io/alignmentresearch/megatron-bridge,
-#               which is what the gpu-tests workflow runs in (image-remote / image-local).
+#               which is what the gpu-tests workflow runs in (image-build-remote / image-build-local).
 #
 # Image build modes:
-#   make image-remote  REMOTE (default). Spins up an ephemeral builder pod on the flamingo
-#                      cluster, syncs your working tree into it, builds against the cluster's
-#                      shared BuildKit (a CPU node with generous RAM — NOT your machine),
-#                      pushes, then tears the pod down. Works from a laptop (only needs kubectl
-#                      pointed at flamingo). See tools/build_image_on_flamingo.sh and
-#                      k8s/build-image-pod.yaml.
-#   make image-local   LOCAL. Builds on this machine's Docker daemon. This image is heavy
-#                      (DeepEP + a full uv sync, ~90 min cold), so prefer the remote path.
+#   make image-build-remote  REMOTE (default). Spins up an ephemeral builder pod on the flamingo
+#                            cluster, syncs your working tree into it, builds against the
+#                            cluster's shared BuildKit (a CPU node with generous RAM — NOT your
+#                            machine), pushes, then tears the pod down. Works from a laptop (only
+#                            needs kubectl pointed at flamingo). The build runs DETACHED and
+#                            survives disconnects. See tools/build_image_on_flamingo.sh and
+#                            k8s/build-image-pod.yaml.
+#   make image-build-local   LOCAL. Builds on this machine's Docker daemon. This image is heavy
+#                            (DeepEP + a full uv sync, ~90 min cold), so prefer the remote path.
 #
 # Dockerfile.ci builds from the BUILD CONTEXT (it COPYs the tree rather than cloning a git ref),
 # so what gets built is your working tree — no need to commit or push your branch first.
@@ -28,8 +29,44 @@
 # --all-groups`, so no arg is needed there. There is deliberately no Dockerfile.farai — we need no
 # fork-specific layers beyond rsync, so adding one would be a merge-conflict surface for nothing.
 IMAGE_REPO ?= ghcr.io/alignmentresearch/megatron-bridge
-IMAGE_TAG ?= latest
+
+# --- Tagging ---------------------------------------------------------------------------------
+# A build publishes unique(IMAGE_TAG, BRANCH_TAG, SHA_TAG, PROMOTE). It never writes :ci or
+# :latest on its own — those are what CI pods and other people pull, so moving them is an explicit
+# act via PROMOTE= or the promote-* targets.
+#
+#   :3995ef57a        exactly this commit, clean tree      (immutable)
+#   :3995ef57a-dirty  this commit plus uncommitted changes (immutable)
+#   :farai-main       moving pointer for the branch
+#   :ci               what CI pods pull                    (promotion only)
+#   :latest           current known-good build             (promotion only)
+#
+# SHA_TAG carries -dirty when the tree is not clean: the build context is the WORKING TREE
+# (Dockerfile.ci COPYs it rather than cloning a ref), so a bare sha would claim a provenance the
+# image does not have. Dirty builds are allowed; only promoting them is gated (see check-promote).
+GIT_DIRTY := $(shell git diff --quiet HEAD 2>/dev/null || echo -dirty)
+SHA_TAG ?= $(shell git rev-parse --short=9 HEAD 2>/dev/null)$(GIT_DIRTY)
+# Branch name sanitized into a legal Docker tag: "farai/main" -> "farai-main" ('/' is illegal).
+BRANCH_TAG ?= $(shell git rev-parse --abbrev-ref HEAD 2>/dev/null | tr '/' '-' | tr -cd '[:alnum:]._-')
+# Primary tag. Defaults to the branch, NOT latest, so a routine build cannot repoint a shared tag.
+IMAGE_TAG ?= $(BRANCH_TAG)
 IMAGE_REF ?= $(IMAGE_REPO):$(IMAGE_TAG)
+
+# PROMOTE: also publish these moving tags in the SAME push, so every tag lands atomically and
+# there is never a window where the image exists but :ci still points at the previous build.
+# Restricted to ci/latest so a typo fails loudly instead of creating a junk tag.
+PROMOTE ?=
+comma := ,
+space := $(subst x,,x x)
+PROMOTE_LIST := $(strip $(subst $(comma),$(space),$(PROMOTE)))
+PROMOTE_BAD := $(filter-out ci latest,$(PROMOTE_LIST))
+# Set ALLOW_DIRTY_PROMOTE=1 to move ci/latest onto a build from a dirty tree.
+ALLOW_DIRTY_PROMOTE ?=
+
+# Deduplicated tag set for the build, as --tag flags.
+TAG_LIST := $(sort $(strip $(IMAGE_TAG) $(BRANCH_TAG) $(SHA_TAG) $(PROMOTE_LIST)))
+TAG_ARGS := $(foreach t,$(TAG_LIST),--tag $(IMAGE_REPO):$(t))
+
 DOCKERFILE ?= docker/Dockerfile.ci
 PLATFORM ?= linux/amd64
 # Upstream's Dockerfile.ci default base is nvcr.io/nvidia/pytorch:26.06-py3; the deleted
@@ -117,7 +154,9 @@ DOCS_PORT ?= 8001
 	test-unit test-unit-core test-unit-diffusion \
 	test-unit-remote test-unit-core-remote test-unit-diffusion-remote \
 	test-list test-logs test-teardown \
-	lint image-remote image-local buildx-builder-local
+	lint image-build-remote image-build-local buildx-builder-local \
+	check-promote image-promote-ci image-promote-latest \
+	image-build-list image-build-logs image-build-teardown
 
 help:
 	@echo ""
@@ -148,18 +187,37 @@ help:
 	@echo "Lint:"
 	@echo "  make lint                 Run all pre-commit hooks over the tree (same as CI)"
 	@echo ""
-	@echo "Docker image (builds $(DOCKERFILE), pushes $(IMAGE_REF)):"
-	@echo "  make image-remote         Build on the flamingo cluster (ephemeral pod -> shared BuildKit) and push"
-	@echo "  make image-local          Build on the local Docker daemon (heavy; ~90 min cold)"
-	@echo "  make buildx-builder-local Ensure the local '$(LOCAL_BUILDER)' buildx builder exists"
+	@echo "Docker image (builds $(DOCKERFILE)):"
+	@echo "  make image-build-remote         Build on the flamingo cluster (ephemeral pod -> shared BuildKit) and push"
+	@echo "  make image-build-local          Build on the local Docker daemon (heavy; ~90 min cold)"
+	@echo "  make buildx-builder-local       Ensure the local '$(LOCAL_BUILDER)' buildx builder exists"
 	@echo ""
-	@echo "Variables (override on the command line, e.g. 'make image-remote IMAGE_TAG=dev'):"
+	@echo "  Remote builds run DETACHED on the pod and survive disconnects:"
+	@echo "    make image-build-list                 List builds still running on the cluster"
+	@echo "    make image-build-logs [JOB=..]        Re-attach to a build's output"
+	@echo "    make image-build-teardown [JOB=..]    Stop a build (JOB=all stops all)"
+	@echo "    FOLLOW=0                              Launch and return immediately"
+	@echo "    KEEP=1                                Leave the builder job up after the build"
+	@echo ""
+	@echo "  A build publishes:$(foreach t,$(TAG_LIST), $(IMAGE_REPO):$(t))"
+	@echo "  It never writes :ci or :latest on its own — promote those deliberately:"
+	@echo "    make image-build-remote PROMOTE=ci            also tag :ci in the same push"
+	@echo "    make image-build-remote PROMOTE=\"ci latest\"    also tag both"
+	@echo "    make image-promote-ci SHA_TAG=<tag>           retag an existing build (no rebuild)"
+	@echo "    make image-promote-latest SHA_TAG=<tag>"
+	@echo ""
+	@echo "Variables (override on the command line, e.g. 'make image-build-remote IMAGE_TAG=dev'):"
+	@echo "  IMAGE_TAG=$(IMAGE_TAG)   (primary tag; defaults to the branch, not latest)"
+	@echo "  BRANCH_TAG=$(BRANCH_TAG)   (set empty to suppress)"
+	@echo "  SHA_TAG=$(SHA_TAG)   (set empty to suppress; -dirty when the tree is not clean)"
+	@echo "  PROMOTE=$(PROMOTE)   (ci and/or latest; refused on a dirty tree)"
+	@echo "  ALLOW_DIRTY_PROMOTE=$(ALLOW_DIRTY_PROMOTE)   (1 to promote from a dirty tree anyway)"
 	@echo "  IMAGE_REF=$(IMAGE_REF)"
 	@echo "  DOCKERFILE=$(DOCKERFILE)"
 	@echo "  PLATFORM=$(PLATFORM)"
 	@echo "  BASE_IMAGE=$(BASE_IMAGE)   (empty => Dockerfile.ci's default NGC PyTorch tag)"
 	@echo "  CACHE_REF=$(CACHE_REF)   (set empty to disable the registry layer cache)"
-	@echo "  IMAGE_OUTPUT=$(IMAGE_OUTPUT)   (image-local only: --push to publish, --load to keep it local)"
+	@echo "  IMAGE_OUTPUT=$(IMAGE_OUTPUT)   (image-build-local only: --push to publish, --load to keep it local)"
 	@echo "  BUILD_JOB_NAME=$(BUILD_JOB_NAME)   (remote build pod name; auto-derived <username>-mbridge-build if empty)"
 	@echo "  GHCR_SECRET_NAME=$(GHCR_SECRET_NAME)   (GHCR push token secret; defaults to api-keys-<username>)"
 	@echo "  GHCR_SECRET_KEY=$(GHCR_SECRET_KEY)   (key inside that secret holding the push token; defaults to GITHUB_PAT)"
@@ -275,17 +333,58 @@ lint:
 # Docker image
 # ==============================
 
+# Reject unknown PROMOTE values, and refuse to move ci/latest onto a dirty build — those tags are
+# what CI and other people pull, and a -dirty image is reproducible from no commit.
+check-promote:
+	@if [ -n "$(strip $(PROMOTE_BAD))" ]; then \
+		echo "ERROR: unrecognized PROMOTE value(s): $(PROMOTE_BAD)"; \
+		echo "       Valid values: ci, latest (e.g. PROMOTE=ci or PROMOTE=\"ci latest\")."; \
+		exit 1; \
+	fi
+	@if [ -n "$(strip $(PROMOTE_LIST))" ] && [ -n "$(GIT_DIRTY)" ] && [ -z "$(ALLOW_DIRTY_PROMOTE)" ]; then \
+		echo "ERROR: refusing to promote [$(PROMOTE_LIST)] from a dirty working tree."; \
+		echo "       The image would be tagged $(SHA_TAG), reproducible from no commit."; \
+		echo "       Commit first, or override with ALLOW_DIRTY_PROMOTE=1."; \
+		exit 1; \
+	fi
+
+# Retro-promotion: repoint :ci / :latest at an ALREADY-PUSHED tag, no rebuild. `imagetools create`
+# copies the manifest registry-side — seconds, no layer transfer. Needs local GHCR credentials
+# with write:packages.
+image-promote-ci:
+	@test -n "$(strip $(SHA_TAG))" || { echo "ERROR: set SHA_TAG=<existing tag to promote>"; exit 1; }
+	@echo "Promoting $(IMAGE_REPO):$(SHA_TAG) -> $(IMAGE_REPO):ci"
+	@docker buildx imagetools create --tag $(IMAGE_REPO):ci $(IMAGE_REPO):$(SHA_TAG)
+
+image-promote-latest:
+	@test -n "$(strip $(SHA_TAG))" || { echo "ERROR: set SHA_TAG=<existing tag to promote>"; exit 1; }
+	@echo "Promoting $(IMAGE_REPO):$(SHA_TAG) -> $(IMAGE_REPO):latest"
+	@docker buildx imagetools create --tag $(IMAGE_REPO):latest $(IMAGE_REPO):$(SHA_TAG)
+
 # --- Remote: build on the cluster (preferred) -------------------------------------------------
-image-remote:
+image-build-remote: check-promote
+	@echo "Publishing tags:$(foreach t,$(TAG_LIST), $(IMAGE_REPO):$(t))"
 	@JOB_NAME='$(BUILD_JOB_NAME)' PRIORITY='$(PRIORITY)' IMAGE_REF='$(IMAGE_REF)' \
+		IMAGE_REPO='$(IMAGE_REPO)' TAG_LIST='$(TAG_LIST)' \
 		PLATFORM='$(PLATFORM)' CACHE_REF='$(CACHE_REF)' DOCKERFILE='$(DOCKERFILE)' \
 		BASE_IMAGE='$(BASE_IMAGE)' FLAMINGO_USERNAME='$(FLAMINGO_USERNAME)' \
 		GHCR_SECRET_NAME='$(GHCR_SECRET_NAME)' GHCR_SECRET_KEY='$(GHCR_SECRET_KEY)' \
-		GHCR_USER='$(GHCR_USER)' \
+		GHCR_USER='$(GHCR_USER)' KEEP='$(KEEP)' FOLLOW='$(FOLLOW)' \
 		bash tools/build_image_on_flamingo.sh
 
+# Manage detached builds. The build runs under setsid on the pod, so a dropped connection or
+# Ctrl-C does not kill it — re-attach with image-build-logs, clean up with image-build-teardown.
+image-build-list:
+	@bash tools/build_image_on_flamingo.sh list
+
+image-build-logs:
+	@JOB='$(JOB)' bash tools/build_image_on_flamingo.sh logs
+
+image-build-teardown:
+	@JOB='$(JOB)' bash tools/build_image_on_flamingo.sh teardown
+
 # --- Local: build on this machine -------------------------------------------------------------
-image-local: buildx-builder-local
+image-build-local: check-promote buildx-builder-local
 	@if [ -z "$$GH_TOKEN" ]; then \
 		echo "ERROR: GH_TOKEN (or GITHUB_PAT) must be set — Dockerfile.ci takes it as a build secret."; \
 		exit 1; \
@@ -301,10 +400,10 @@ image-local: buildx-builder-local
 		$(BASE_ARGS) \
 		--secret id=GH_TOKEN,env=GH_TOKEN \
 		$(CACHE_ARGS) \
-		--tag $(IMAGE_REF) \
+		$(TAG_ARGS) \
 		$(IMAGE_OUTPUT) \
 		.
-	@echo "Done: $(IMAGE_REF) ($(IMAGE_OUTPUT))"
+	@echo "Done ($(IMAGE_OUTPUT)):$(foreach t,$(TAG_LIST), $(IMAGE_REPO):$(t))"
 
 buildx-builder-local:
 	@command -v docker >/dev/null 2>&1 || { echo "ERROR: docker not found on PATH."; exit 1; }

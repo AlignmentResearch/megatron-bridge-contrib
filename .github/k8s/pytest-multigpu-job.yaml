@@ -39,7 +39,10 @@ spec:
           emptyDir: {}
       containers:
         - name: test-container
-          image: ghcr.io/alignmentresearch/megatron-bridge:latest
+          # :ci, not :latest — a routine `make image-build-remote` must not be able to change what CI
+          # runs. This tag moves only on an explicit `make image-build-remote PROMOTE=ci` or
+          # `make image-promote-ci`. Still a moving tag, hence imagePullPolicy: Always.
+          image: ghcr.io/alignmentresearch/megatron-bridge:ci
           imagePullPolicy: Always
           command:
             - bash

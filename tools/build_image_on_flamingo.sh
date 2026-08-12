@@ -18,7 +18,7 @@
 # synced below — there is no git ref to pass and no need to commit or push your branch first.
 # Uncommitted changes are built as-is.
 #
-# Usage: invoked by `make image-remote`. Override via env: IMAGE_REF, PLATFORM, BASE_IMAGE,
+# Usage: invoked by `make image-build-remote`. Override via env: IMAGE_REF, PLATFORM, BASE_IMAGE,
 #        CACHE_REF, JOB_NAME, PRIORITY, READY_TIMEOUT.
 set -euo pipefail
 
@@ -31,6 +31,120 @@ kubectl get pods >/dev/null 2>&1 || {
   exit 1
 }
 
+# ---- job discovery / follow helpers ----------------------------------------------------------
+# Discovers THIS tool's builder jobs only.
+BUILD_JOB_SELECTOR="app.kubernetes.io/name=megatron-bridge-image-build,app.kubernetes.io/component=local-dev"
+# Detached-run bookkeeping files written under /build on the pod.
+LOGF_NAME=".mbridge-build.log"
+EXITF_NAME=".mbridge-build.exit"
+RUNNER_NAME=".mbridge-build.sh"
+
+list_build_jobs() {
+  kubectl get jobs -l "$BUILD_JOB_SELECTOR" \
+    -o 'jsonpath={range .items[*]}{.metadata.name}{"\t"}{.status.active}{"\t"}{.metadata.creationTimestamp}{"\n"}{end}' \
+    2>/dev/null
+}
+
+# Echo the chosen job name (empty if none). JOB= wins; one job auto-selects; several -> interactive
+# menu on a TTY, else an error listing the names.
+select_build_job() {
+  local names=() line n
+  while IFS= read -r line; do
+    n="${line%%	*}"
+    [ -n "$n" ] && names+=("$n")
+  done < <(list_build_jobs)
+  if [ "${#names[@]}" -eq 0 ]; then return 0; fi
+  if [ -n "${JOB:-}" ]; then printf '%s\n' "$JOB"; return 0; fi
+  if [ "${#names[@]}" -eq 1 ]; then printf '%s\n' "${names[0]}"; return 0; fi
+  if [ -t 0 ] && [ -t 2 ]; then
+    >&2 echo "Multiple builder jobs — pick one:"
+    local choice
+    select choice in "${names[@]}"; do
+      [ -n "$choice" ] && { printf '%s\n' "$choice"; return 0; }
+    done
+  fi
+  >&2 echo "Multiple builder jobs found; re-run with JOB=<name>:"
+  local m; for m in "${names[@]}"; do >&2 echo "    $m"; done
+  return 1
+}
+
+pod_of_job() { kubectl get pods -l job-name="$1" -o jsonpath='{.items[0].metadata.name}' 2>/dev/null; }
+
+# Follow a detached build's log, printing only new lines, until the exit sentinel appears; returns
+# the build's exit code. Each step is a short independent `kubectl exec`, so a transient connection
+# blip just skips a poll and resumes — the build runs on the pod regardless of this follower. This
+# is the whole point of detaching: a ~90 min build previously died with the streaming exec.
+follow_logs() {
+  local pod="$1" logf="$2" exitf="$3" printed=0 total rc phase gone=0
+  while :; do
+    total="$(kubectl exec "$pod" -- sh -c "wc -l < '$logf' 2>/dev/null" 2>/dev/null | tr -dc '0-9' || true)"
+    total="${total:-0}"
+    if [ "$total" -gt "$printed" ] 2>/dev/null; then
+      kubectl exec "$pod" -- sed -n "$((printed + 1)),${total}p" "$logf" 2>/dev/null || true
+      printed="$total"
+    fi
+    rc="$(kubectl exec "$pod" -- sh -c "cat '$exitf' 2>/dev/null" 2>/dev/null | tr -dc '0-9' || true)"
+    if [ -n "$rc" ]; then
+      kubectl exec "$pod" -- sed -n "$((printed + 1)),\$p" "$logf" 2>/dev/null || true
+      return "$rc"
+    fi
+    # Stop polling a pod that died without writing the sentinel (evicted / OOM / lost node).
+    # Two consecutive observations, so a transient `kubectl get` blip can't end the follow early.
+    phase="$(kubectl get pod "$pod" -o jsonpath='{.status.phase}' 2>/dev/null || true)"
+    case "${phase:-gone}" in
+      Running|Pending|Unknown) gone=0 ;;
+      *)
+        gone=$((gone + 1))
+        if [ "$gone" -ge 2 ]; then
+          echo "▶ pod $pod is no longer running (phase='${phase:-gone}') and wrote no exit code —"
+          echo "    the build was killed mid-flight. Investigate with:"
+          echo "    kubectl describe pod $pod | grep -iE 'reason|message|evict|oom'"
+          return 137
+        fi
+        ;;
+    esac
+    sleep 5
+  done
+}
+
+# ---- action dispatch ---------------------------------------------------------------------------
+ACTION="${1:-${ACTION:-run}}"
+case "$ACTION" in run|logs|teardown|list) ;; *) echo "ERROR: unknown action '$ACTION' (run|logs|teardown|list)."; exit 1 ;; esac
+
+if [ "$ACTION" = "list" ]; then
+  rows="$(list_build_jobs)"
+  if [ -z "$rows" ]; then echo "No builder jobs running."; exit 0; fi
+  echo "Builder jobs (follow: make image-build-logs JOB=<name> ; stop: make image-build-teardown JOB=<name>):"
+  printf '%s\n' "$rows" | awk -F'\t' 'NF{printf "  %-44s active=%-4s created=%s\n",$1,($2==""?"0":$2),$3}'
+  exit 0
+fi
+
+if [ "$ACTION" = "teardown" ]; then
+  if [ "${JOB:-}" = "all" ]; then
+    echo "▶ Tearing down ALL builder jobs"
+    kubectl delete jobs -l "$BUILD_JOB_SELECTOR" --ignore-not-found
+    exit 0
+  fi
+  j="$(select_build_job)" || exit 1
+  [ -z "$j" ] && { echo "No builder jobs to tear down."; exit 0; }
+  echo "▶ Tearing down builder job $j"
+  kubectl delete job "$j" --ignore-not-found
+  exit 0
+fi
+
+if [ "$ACTION" = "logs" ]; then
+  j="$(select_build_job)" || exit 1
+  [ -z "$j" ] && { echo "No builder jobs to follow."; exit 0; }
+  pod="$(pod_of_job "$j")"
+  [ -z "$pod" ] && { echo "ERROR: no pod found for job $j (still scheduling, or torn down)."; exit 1; }
+  echo "▶ Following $j ($pod) — Ctrl-C stops following; the build keeps running."
+  rc=0; follow_logs "$pod" "/build/$LOGF_NAME" "/build/$EXITF_NAME" || rc=$?
+  echo "▶ Build on $j finished (rc=$rc)."
+  exit "$rc"
+fi
+
+# ===================================  ACTION = run  ===========================================
+
 # ---- identity + config (overridable via env) -------------------------------------------------
 # Your cluster username, used to locate your per-user secret. Priority: explicit FLAMINGO_USERNAME,
 # else parsed from `kubectl auth whoami` (e.g. oidc:you@far.ai -> you).
@@ -39,12 +153,29 @@ if [ -z "${FLAMINGO_USERNAME:-}" ]; then
     | sed -e 's/^[^:]*://' -e 's/@.*//' || true)"
 fi
 
-JOB_NAME="${JOB_NAME:-${FLAMINGO_USERNAME:-${USER:-mbridge}}-mbridge-build}"
+# Random DNS-1123-safe suffix so concurrent/detached builds don't collide on one job name.
+rand_suffix() {
+  local chars=abcdefghijklmnopqrstuvwxyz0123456789 s=""
+  for _ in 1 2 3 4 5; do s+="${chars:RANDOM%36:1}"; done
+  printf '%s' "$s"
+}
+JOB_NAME="${JOB_NAME:-${FLAMINGO_USERNAME:-${USER:-mbridge}}-mbridge-build-$(rand_suffix)}"
+USER_LABEL="${FLAMINGO_USERNAME:-unknown}"
 PRIORITY="${PRIORITY:-interactive}"
-IMAGE_REF="${IMAGE_REF:-ghcr.io/alignmentresearch/megatron-bridge:latest}"
+IMAGE_REPO="${IMAGE_REPO:-ghcr.io/alignmentresearch/megatron-bridge}"
+# Tags to publish. Normally supplied by `make image-build-remote` as a space-separated TAG_LIST
+# (branch + sha [+ ci/latest when promoting]); standalone runs fall back to deriving them here so
+# the script is usable without make. See the tagging block in the Makefile for the full scheme.
+if [ -z "${TAG_LIST:-}" ]; then
+  _sha="$(git -C "$(git rev-parse --show-toplevel 2>/dev/null || echo .)" rev-parse --short=9 HEAD 2>/dev/null || true)"
+  git diff --quiet HEAD 2>/dev/null || _sha="${_sha}-dirty"
+  _branch="$(git rev-parse --abbrev-ref HEAD 2>/dev/null | tr '/' '-' | tr -cd '[:alnum:]._-' || true)"
+  TAG_LIST="$(printf '%s\n%s\n' "$_branch" "$_sha" | grep -v '^$' | sort -u | tr '\n' ' ')"
+fi
+IMAGE_REF="${IMAGE_REF:-${IMAGE_REPO}:$(printf '%s' "$TAG_LIST" | awk '{print $1}')}"
 PLATFORM="${PLATFORM:-linux/amd64}"
 # Note: `-` not `:-` so an explicitly empty CACHE_REF (the documented "disable cache" knob,
-# forwarded by `make image-remote CACHE_REF=`) is honored rather than reset to the default.
+# forwarded by `make image-build-remote CACHE_REF=`) is honored rather than reset to the default.
 CACHE_REF="${CACHE_REF-ghcr.io/alignmentresearch/megatron-bridge:cache}"
 # Empty => Dockerfile.ci's own default NGC PyTorch tag.
 BASE_IMAGE="${BASE_IMAGE:-}"
@@ -91,7 +222,7 @@ kubectl get secret "$GHCR_SECRET_NAME" -o "jsonpath={.data.$GHCR_SECRET_KEY}" 2>
   exit 1
 }
 
-echo "▶ Building $IMAGE_REF"
+echo "▶ Building$(for t in $TAG_LIST; do printf ' %s:%s' "$IMAGE_REPO" "$t"; done)"
 echo "    dockerfile : $DOCKERFILE (working tree)"
 echo "    source     : the synced working tree IS the build context (no git ref; uncommitted changes included)"
 echo "    platform   : $PLATFORM"
@@ -99,8 +230,13 @@ echo "    base image : ${BASE_IMAGE:-<Dockerfile.ci default>}"
 echo "    push creds : secret ${GHCR_SECRET_NAME}[${GHCR_SECRET_KEY}] as ghcr.io user '$GHCR_USER'"
 echo "    job/context: $JOB_NAME @ $(kubectl config current-context)"
 
-# ---- always tear the builder down ------------------------------------------------------------
+# ---- teardown only on EARLY failure ----------------------------------------------------------
+# Once the build is launched DETACHED on the pod it owns its lifecycle: a Ctrl-C or dropped
+# connection must NOT kill it (re-attach with `logs`, clean up with `teardown`). So the trap only
+# tears the Job down if we exit before that hand-off (e.g. the pod never scheduled).
+LAUNCHED=0
 cleanup() {
+  [ "$LAUNCHED" = 1 ] && return 0
   echo "▶ Tearing down builder job $JOB_NAME"
   kubectl delete job "$JOB_NAME" --ignore-not-found --wait=false >/dev/null 2>&1 || true
 }
@@ -113,6 +249,7 @@ sed -e "s|__JOB_NAME__|${JOB_NAME}|g" \
     -e "s|__GHCR_SECRET_NAME__|${GHCR_SECRET_NAME}|g" \
     -e "s|__GHCR_SECRET_KEY__|${GHCR_SECRET_KEY}|g" \
     -e "s|__GHCR_USER__|${GHCR_USER}|g" \
+    -e "s|__USER_LABEL__|${USER_LABEL}|g" \
     "$REPO_ROOT/$MANIFEST" | kubectl create -f -
 
 # ---- wait for the pod to be running ----------------------------------------------------------
@@ -170,29 +307,109 @@ if grep -q '^ARG INSTALL_DIFFUSION_DEPS' "$REPO_ROOT/$DOCKERFILE" 2>/dev/null; t
   diffusion_args="--build-arg INSTALL_DIFFUSION_DEPS=true"
 fi
 
+# Every tag in one push, so they land atomically — no window where the image exists but a moving
+# tag still points at the previous build.
+tag_args=""
+for _t in $TAG_LIST; do
+  tag_args="${tag_args} --tag ${IMAGE_REPO}:${_t}"
+done
+
+# Write the build to a script on the pod, then start it under setsid with its own log and
+# exit-code sentinel. setsid + redirected stdio means the build outlives both this `kubectl exec`
+# returning AND any later disconnect — a ~90 min build streamed over one exec dies on any network
+# blip, which is exactly what used to happen at stage 10/12.
+#
 # GH_TOKEN / GHCR_TOKEN are read from the pod's env (k8s secrets) — they never leave the cluster,
 # and `\$GHCR_TOKEN` is escaped so the host shell doesn't interpolate it here.
-kubectl exec -i "$POD" -- sh -eu -c "
-  cd /build/repo
-  printf '%s' \"\$GHCR_TOKEN\" | docker login ghcr.io -u \"\$GHCR_USER\" --password-stdin
-  if ! docker buildx inspect flamingo >/dev/null 2>&1; then
-    docker buildx create --name flamingo \
-      --driver remote tcp://${BUILDKIT_ADDRESS}:1234 \
-      --driver-opt=cacert=${CERT_ROOT}/ca.crt \
-      --driver-opt=cert=${CERT_ROOT}/tls.crt \
-      --driver-opt=key=${CERT_ROOT}/tls.key
-  fi
-  docker buildx build \
-    --builder flamingo \
-    --platform ${PLATFORM} \
-    --file ${DOCKERFILE} \
-    ${diffusion_args} \
-    ${base_args} \
-    --secret id=GH_TOKEN,env=GH_TOKEN \
-    ${cache_args} \
-    --tag ${IMAGE_REF} \
-    --push \
-    .
-"
+# Write via `tee`, NOT `sh -c "cat > file"`. This pod is alpine (docker:27-cli), whose busybox ash
+# consumes the piped stdin while parsing, so cat sees EOF and writes a ZERO-BYTE file. `sh` then
+# runs an empty script, exits 0 instantly, and the run looks like an instant success while nothing
+# was built. tools/test_on_flamingo.sh gets away with the cat form because its pod is Ubuntu-based
+# with a different shell.
+echo "▶ Writing build runner to $POD:/build/$RUNNER_NAME"
+kubectl exec -i "$POD" -- tee "/build/$RUNNER_NAME" >/dev/null <<RUNNER
+set -eu
+cd /build/repo
+printf '%s' "\$GHCR_TOKEN" | docker login ghcr.io -u "\$GHCR_USER" --password-stdin
+if ! docker buildx inspect flamingo >/dev/null 2>&1; then
+  docker buildx create --name flamingo \\
+    --driver remote tcp://${BUILDKIT_ADDRESS}:1234 \\
+    --driver-opt=cacert=${CERT_ROOT}/ca.crt \\
+    --driver-opt=cert=${CERT_ROOT}/tls.crt \\
+    --driver-opt=key=${CERT_ROOT}/tls.key
+fi
+docker buildx build \\
+  --builder flamingo \\
+  --platform ${PLATFORM} \\
+  --file ${DOCKERFILE} \\
+  ${diffusion_args} \\
+  ${base_args} \\
+  --secret id=GH_TOKEN,env=GH_TOKEN \\
+  ${cache_args} \\
+  ${tag_args} \\
+  --push \\
+  .
+RUNNER
 
-echo "▶ Done: pushed $IMAGE_REF"
+# Fail fast if the runner did not land or is not valid shell. An empty runner exits 0 immediately,
+# which would otherwise be indistinguishable from a successful build — the exact failure this
+# guards against.
+_runner_bytes="$(kubectl exec "$POD" -- wc -c "/build/$RUNNER_NAME" 2>/dev/null | tr -dc '0-9' | head -c 12 || true)"
+if [ "${_runner_bytes:-0}" -lt 100 ]; then
+  echo "ERROR: build runner did not land on the pod (/build/$RUNNER_NAME is ${_runner_bytes:-0} bytes)."
+  echo "       Refusing to launch — an empty runner exits 0 and looks like a successful build."
+  exit 1
+fi
+if ! kubectl exec "$POD" -- sh -n "/build/$RUNNER_NAME" 2>/dev/null; then
+  echo "ERROR: build runner on the pod is not valid shell — refusing to launch."
+  exit 1
+fi
+
+LOGF="/build/$LOGF_NAME"
+EXITF="/build/$EXITF_NAME"
+echo "▶ Launching build (detached on the pod — survives disconnects)"
+kubectl exec "$POD" -- sh -c "
+  cd /build && rm -f '$EXITF' '$LOGF'
+  setsid sh -c 'sh \"$RUNNER_NAME\" > \"$LOGF_NAME\" 2>&1; echo \$? > \"$EXITF_NAME\"' \
+    </dev/null >/dev/null 2>&1 &
+  sleep 1   # let setsid fork into its own session before this exec session closes
+"
+LAUNCHED=1   # the build now owns its lifecycle; the EXIT trap no longer tears the Job down
+
+if [ "${FOLLOW:-1}" != "1" ]; then
+  echo "▶ Launched in the background as job $JOB_NAME (FOLLOW=0)."
+  echo "    follow:   make image-build-logs JOB=$JOB_NAME"
+  echo "    teardown: make image-build-teardown JOB=$JOB_NAME"
+  exit 0
+fi
+
+echo "▶ Following build output — Ctrl-C stops following (build keeps running; re-attach: make image-build-logs JOB=$JOB_NAME)"
+rc=0; follow_logs "$POD" "$LOGF" "$EXITF" || rc=$?
+
+# Do not trust the exit code alone: confirm every tag actually resolves in the registry before
+# claiming success. A build that silently does nothing still exits 0, and callers (and humans)
+# reasonably treat "Done: pushed" as ground truth. Run from inside the pod, which already holds
+# the GHCR credentials from the runner's `docker login`.
+if [ "$rc" -eq 0 ]; then
+  for _t in $TAG_LIST; do
+    if ! kubectl exec "$POD" -- docker buildx imagetools inspect "${IMAGE_REPO}:${_t}" >/dev/null 2>&1; then
+      echo "ERROR: build exited 0 but ${IMAGE_REPO}:${_t} is not in the registry."
+      echo "       Treating this as a failure; inspect the build log with:"
+      echo "       kubectl exec $POD -- cat $LOGF"
+      rc=1
+      break
+    fi
+  done
+fi
+
+if [ "$rc" -eq 0 ]; then
+  echo "▶ Done: pushed$(for t in $TAG_LIST; do printf ' %s:%s' "$IMAGE_REPO" "$t"; done)"
+else
+  echo "▶ Build failed (rc=$rc)"
+fi
+if [ "${KEEP:-0}" = "1" ]; then
+  echo "▶ KEEP=1 — leaving job $JOB_NAME up (teardown: make image-build-teardown JOB=$JOB_NAME)"
+else
+  kubectl delete job "$JOB_NAME" --ignore-not-found --wait=false >/dev/null 2>&1 || true
+fi
+exit "$rc"

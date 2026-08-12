@@ -177,7 +177,7 @@ No `HF_TOKEN` is needed — see [Hugging Face access](#hugging-face-access) abov
 
 ### Container image
 
-The pod runs `ghcr.io/alignmentresearch/megatron-bridge:latest`, built from upstream's
+The pod runs `ghcr.io/alignmentresearch/megatron-bridge:ci`, built from upstream's
 `docker/Dockerfile.ci`. The diffusion unit suite needs hash-locked WAN codecs: bases that gate
 those behind `ARG INSTALL_DIFFUSION_DEPS` (off by default, so the codecs stay out of shipped
 framework images) get the arg passed automatically, while older bases install them unconditionally
@@ -186,9 +186,14 @@ flag only when it exists. Apart from an rsync layer there is no fork-specific Do
 and push with:
 
 ```sh
-make image-remote         # on the cluster (preferred)
-make image-local          # see `make help` for IMAGE_TAG / BASE_IMAGE / CACHE_REF
+make image-build-remote                  # on the cluster (preferred); tags :<branch> and :<sha>
+make image-build-remote PROMOTE=ci       # ...and moves :ci, which is what these pods pull
+make image-promote-ci SHA_TAG=<tag>      # or repoint :ci at an already-pushed build, no rebuild
 ```
+
+`:ci` moves **only** on an explicit promotion, so a routine build by anyone cannot change what CI
+runs. Promotion is refused from a dirty working tree (override: `ALLOW_DIRTY_PROMOTE=1`), since a
+`-dirty` image is reproducible from no commit and would make a red CI run untraceable.
 
 The pod also needs the `docker` imagePullSecret in the `ci` namespace to have read access to that
 GHCR package.

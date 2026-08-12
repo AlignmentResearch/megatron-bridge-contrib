@@ -109,7 +109,7 @@ The unit suites need 2 GPUs, which a laptop does not have, so `tools/test_on_fla
 GPU pod on the flamingo cluster against your **local working tree** — uncommitted changes included. It uses the same
 image and the same launcher scripts as CI, so local and CI stay in parity.
 
-Everything below (and `make image-remote`) needs a kubectl context pointing at flamingo. That takes **three** merged
+Everything below (and `make image-build-remote`) needs a kubectl context pointing at flamingo. That takes **three** merged
 kubeconfigs — `~/.kube/config` alone defines only local clusters, the `h100-*` contexts live in `far-config`, and the
 `h100` cluster definition itself comes from the [flamingo](https://github.com/AlignmentResearch/flamingo) repo. Without
 all three, `kubectl` fails with "context was not found":
@@ -139,13 +139,37 @@ Both CI and the remote test runner pull `ghcr.io/alignmentresearch/megatron-brid
 too heavy for most laptops. `tools/build_image_on_flamingo.sh` runs it on the cluster's shared BuildKit instead:
 
 ```sh
-make image-remote                  # build on the cluster, push to GHCR (preferred)
-make image-local                   # build on this machine's Docker daemon
-make image-remote IMAGE_TAG=dev    # any variable from `make help` can be overridden
+make image-build-remote                  # build on the cluster, push to GHCR (preferred)
+make image-build-local                   # build on this machine's Docker daemon
+make image-build-remote IMAGE_TAG=dev    # any variable from `make help` can be overridden
 ```
 
-`image-remote` needs only a kubectl context pointing at flamingo; the GHCR push token is read in-cluster from your
-`api-keys-<username>` secret, so no credentials are handled locally. `image-local` needs `GH_TOKEN` (or `GITHUB_PAT`)
+**Tagging.** A build publishes an immutable sha tag and a moving branch tag — `:3995ef57a` and
+`:farai-main`. It never writes `:ci` or `:latest`, because those are what CI pods and other people
+pull and a routine build must not repoint them:
+
+| Tag | Meaning |
+|---|---|
+| `:<sha>` / `:<sha>-dirty` | exactly this commit; `-dirty` when the tree had uncommitted changes |
+| `:<branch>` | moving pointer for the branch |
+| `:ci` | what CI pods pull — promotion only |
+| `:latest` | current known-good build — promotion only |
+
+```sh
+make image-build-remote PROMOTE=ci            # also tag :ci, in the same atomic push
+make image-build-remote PROMOTE="ci latest"   # also tag both
+make image-promote-ci SHA_TAG=3995ef57a       # retag an existing build, no rebuild
+```
+
+`PROMOTE` accepts only `ci` and `latest`, so a typo fails rather than creating a junk tag, and it
+refuses to run from a dirty tree — a `-dirty` image is reproducible from no commit, so pointing CI
+at one makes a failure untraceable. Override with `ALLOW_DIRTY_PROMOTE=1`. Dirty *builds* are fine;
+only moving the shared tags is gated. The standalone `promote-*` targets use
+`docker buildx imagetools create`, which copies the manifest registry-side — seconds, no download,
+but it needs local GHCR credentials with `write:packages`.
+
+`image-build-remote` needs only a kubectl context pointing at flamingo; the GHCR push token is read in-cluster from your
+`api-keys-<username>` secret, so no credentials are handled locally. `image-build-local` needs `GH_TOKEN` (or `GITHUB_PAT`)
 in your environment, since `Dockerfile.ci` takes it as a build secret.
 
 There is deliberately **no fork-specific Dockerfile** — beyond the rsync layer in patch 7 we need no extra layers, so
