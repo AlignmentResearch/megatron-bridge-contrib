@@ -32,7 +32,12 @@ import torch
 
 from megatron.bridge.peft.dora import DoRA
 from megatron.bridge.peft.lora import LoRAMerge
-from megatron.bridge.peft.utils import ParallelLinearAdapter, pad_seq_to_mult, unpad_seq_to_mult
+from megatron.bridge.peft.utils import (
+    AdapterAttributes,
+    ParallelLinearAdapter,
+    pad_seq_to_mult,
+    unpad_seq_to_mult,
+)
 
 
 IN, DIM, OUT, ETP = 16, 4, 8, 4
@@ -276,14 +281,39 @@ def test_dora_refuses_expert_linears():
         dora.transform(module, name="linear_fc2", prefix="decoder.layers.0.mlp.experts.0")
 
 
-def test_dora_refuses_suppressed_comm_linears():
+class _DummyDoRALinear(torch.nn.Module):
+    def __init__(self, to_wrap, adapter):
+        super().__init__()
+
+
+@patch("megatron.bridge.peft.dora.DoRALinear", new=_DummyDoRALinear)
+@patch("megatron.bridge.peft.dora.ParallelLinearDoRAAdapter")
+@patch("megatron.bridge.peft.dora.get_adapter_attributes_from_linear")
+def test_dora_refuses_suppressed_comm_parallel_bases(mock_attrs, mock_adapter):
     """Shared-expert fc2 under moe_shared_expert_overlap: DoRA's per-rank magnitude norm does
-    not compose with the downstream TP sum, so refuse instead of training silently wrong."""
+    not compose with the downstream TP sum, so refuse instead of training silently wrong. A
+    replicated base (duplicated TELinear) also reports suppressed comm but has no downstream
+    TP reduction, so it must stay allowed."""
+
+    def attrs(dtc, blip):
+        return AdapterAttributes(
+            input_is_parallel=True,
+            in_features=4,
+            out_features=4,
+            disable_tensor_parallel_comm=dtc,
+            disable_sequence_parallel_comm=True,
+            base_linear_is_parallel=blip,
+        )
+
     dora = DoRA()
     module = torch.nn.Linear(4, 4)
-    module.parallel_mode = None
+
+    mock_attrs.return_value = attrs(dtc=True, blip=True)
     with pytest.raises(NotImplementedError, match="suppressed"):
         dora.transform(module, name="linear_fc2", prefix="decoder.layers.0.mlp.shared_experts")
+
+    mock_attrs.return_value = attrs(dtc=True, blip=False)
+    dora.transform(module, name="linear_fc2", prefix="decoder.layers.0.mlp.shared_experts")
 
 
 @patch("megatron.bridge.peft.utils.parallel_state")
