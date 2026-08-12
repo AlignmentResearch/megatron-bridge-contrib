@@ -1135,16 +1135,13 @@ def test_grouped_export_merges_adapter_into_stacked_tensor(monkeypatch):
 
     model = SimpleNamespace(config=SimpleNamespace(num_moe_experts=num_experts))
     monkeypatch.setattr(mb, "unwrap_model", lambda m: [model])
-    monkeypatch.setattr(
-        mb.parallel_state, "get_expert_model_parallel_world_size", lambda: 1, raising=False
-    )
+    monkeypatch.setattr(mb.parallel_state, "get_expert_model_parallel_world_size", lambda: 1, raising=False)
     monkeypatch.setattr(bridge, "_share_embeddings_and_output_weights", lambda cfg: False)
     monkeypatch.setattr(
         bridge,
         "build_adapter_conversion_tasks",
         lambda m: {
-            f"decoder.layers.0.mlp.experts.local_experts.{i}.linear_fc2": [object()]
-            for i in range(num_experts)
+            f"decoder.layers.0.mlp.experts.local_experts.{i}.linear_fc2": [object()] for i in range(num_experts)
         },
     )
     monkeypatch.setattr(bridge, "materialize_adapter_weights", lambda tasks_: [adapter_weight])
