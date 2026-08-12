@@ -97,6 +97,13 @@ class DoRA(PEFT, ModuleMatcher):
                     "compose with expert parallelism (TP, ETP, or EP > 1). Exclude expert "
                     "modules from target_modules to proceed."
                 )
+            if getattr(m, "parallel_mode", "") is None or getattr(m, "explicit_expert_comm", False):
+                raise NotImplementedError(
+                    f"DoRA does not support linears whose own tensor-parallel communication is "
+                    f"suppressed (matched {full_name}; e.g. shared experts under "
+                    "moe_shared_expert_overlap): DoRA's per-rank magnitude norm does not compose "
+                    "with the downstream TP reduction. Exclude the module from target_modules."
+                )
             attrs = get_adapter_attributes_from_linear(m)
             logger.info(f"Adding DoRA to: {full_name}")
             adapter = ParallelLinearDoRAAdapter(

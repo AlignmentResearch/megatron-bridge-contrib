@@ -529,7 +529,14 @@ class ParallelLinearAdapter(nn.Module):
         # remains right. `use_a2a` needs no special handling: every sequence-parallel block in
         # forward() is gated on `not self.is_expert`.
         self._expert_row_parallel = bool(is_expert and input_is_parallel and base_linear_is_parallel)
-        if self._expert_row_parallel:
+        # Shared-expert fc2 under moe_shared_expert_overlap is the same disease over the DENSE
+        # TP group: the base's own collectives are suppressed (that is what
+        # disable_tensor_parallel_comm reports) and SharedExpertMLP.post_forward_comm sums the
+        # full-width partials across TP, so a gathered delta would be counted TP times.
+        self._shared_expert_row_parallel = bool(
+            not is_expert and disable_tensor_parallel_comm and input_is_parallel and base_linear_is_parallel
+        )
+        if self._expert_row_parallel or self._shared_expert_row_parallel:
             lin_out_gather_output = False
 
         self.linear_out = ColumnParallelLinear(
@@ -643,24 +650,31 @@ class ParallelLinearAdapter(nn.Module):
             )
         return copy_to_tensor_model_parallel_region(x, etp_group)
 
-    def _embed_expert_row_parallel_shard(self, x: torch.Tensor) -> torch.Tensor:
+    def _embed_row_parallel_shard(self, x: torch.Tensor) -> torch.Tensor:
         """Place this rank's hidden shard into a full-width buffer of zeros.
 
-        The base emits a full-width partial and the dispatcher sums those across ETP, so the
-        adapter has to contribute in the same currency. Zero-padding rather than gathering
-        means each output element has exactly one non-zero contributor, so the sum that
-        follows reproduces `B @ z` once, with no `1/ETP` factor to derive. Padding is
-        differentiable and its adjoint is the matching slice, so `dL/dB_r` needs no
-        compensation either.
+        The base emits a full-width partial and a downstream sum reduces those across a group
+        -- the MoE token dispatcher over ETP for routed experts, and
+        SharedExpertMLP.post_forward_comm over the dense TP group for shared-expert fc2 under
+        moe_shared_expert_overlap -- so the adapter has to contribute in the same currency.
+        Zero-padding rather than gathering means each output element has exactly one non-zero
+        contributor, so the sum that follows reproduces `B @ z` once, with no `1/size` factor
+        to derive. Padding is differentiable and its adjoint is the matching slice, so
+        `dL/dB_r` needs no compensation either.
         """
-        if not self._expert_row_parallel:
+        if self._expert_row_parallel:
+            size = parallel_state.get_expert_tensor_parallel_world_size()
+            rank = parallel_state.get_expert_tensor_parallel_rank()
+        elif self._shared_expert_row_parallel:
+            size = parallel_state.get_tensor_model_parallel_world_size()
+            rank = parallel_state.get_tensor_model_parallel_rank()
+        else:
             return x
-        etp_size = parallel_state.get_expert_tensor_parallel_world_size()
-        if etp_size <= 1:
+        if size <= 1:
             return x
         shard_width = x.shape[-1]
-        left = parallel_state.get_expert_tensor_parallel_rank() * shard_width
-        right = (etp_size - 1) * shard_width - left
+        left = rank * shard_width
+        right = (size - 1) * shard_width - left
         return nn.functional.pad(x, (left, right))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -701,7 +715,7 @@ class ParallelLinearAdapter(nn.Module):
             x.activation_offloading = True
         x, _ = self.linear_out(x)
 
-        x = self._embed_expert_row_parallel_shard(x)
+        x = self._embed_row_parallel_shard(x)
 
         if not self.disable_sequence_parallel_comm and self.input_is_parallel and not self.is_expert:
             # for attention_dense and linear_fc2

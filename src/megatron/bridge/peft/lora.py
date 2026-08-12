@@ -258,10 +258,13 @@ class LoRAMerge(PEFT):
         linear_in: torch.Tensor,
         alpha: int,
         dim: int,
+        is_expert: bool = False,
     ) -> torch.Tensor:
         """
         Merges the LoRA adapter weights with the base model weights.
-        Handles tensor parallelism by gathering sharded dimensions.
+        Handles tensor parallelism by gathering sharded dimensions. An expert adapter's
+        child linears shard over the expert tensor-parallel group, not the dense TP group,
+        so the gathers must run there (the two differ whenever TP != ETP).
 
         For ColumnParallelLinear (e.g., linear_qkv, linear_fc1):
             - base_weight: (out_features/TP, in_features)
@@ -286,14 +289,20 @@ class LoRAMerge(PEFT):
             torch.Tensor: The merged weights.
         """
 
-        tp_size = parallel_state.get_tensor_model_parallel_world_size()
+        if is_expert:
+            tp_size = parallel_state.get_expert_tensor_parallel_world_size()
+        else:
+            tp_size = parallel_state.get_tensor_model_parallel_world_size()
 
         if tp_size == 1:
             # No tensor parallelism, simple multiplication
             lora_weight = alpha / dim * (linear_out @ linear_in)
             return base_weight + lora_weight
 
-        tp_group = parallel_state.get_tensor_model_parallel_group()
+        if is_expert:
+            tp_group = parallel_state.get_expert_tensor_parallel_group()
+        else:
+            tp_group = parallel_state.get_tensor_model_parallel_group()
 
         # Case 1: ColumnParallelLinear - linear_in is sharded on dim 0
         # linear_in: (dim/TP, in_features), linear_out: (out_features/TP, dim)
@@ -349,6 +358,7 @@ class LoRAMerge(PEFT):
                 module.adapter.linear_in.weight.to(base_device),
                 module.adapter.alpha,
                 module.adapter.dim,
+                is_expert=getattr(module.adapter, "is_expert", False),
             )
             module.to_wrap.weight.data = merged_weight
         else:  # TE Grouped Linear
@@ -360,6 +370,7 @@ class LoRAMerge(PEFT):
                     module.adapter.linear_in.weight.to(base_device),
                     module.adapter.alpha,
                     module.adapter.dim,
+                    is_expert=getattr(module.adapter, "is_expert", False),
                 )
                 getattr(module.to_wrap, f"weight{i}").data = merged_weight
         return module

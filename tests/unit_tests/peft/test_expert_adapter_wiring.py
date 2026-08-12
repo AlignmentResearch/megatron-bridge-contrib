@@ -16,10 +16,11 @@
 
 The algebra files (test_expert_row_parallel_adapter_algebra.py,
 test_expert_column_parallel_adapter_backward_algebra.py) prove the intended arithmetic in
-closed form. These tests pin the SHIPPED code to that arithmetic: the construction predicate,
-the forced gather_output=False, the zero-embed offsets computed by the real method, the
-placement of the collective completions inside forward(), and gradient flow through the
-pad/unpad helpers. Reverting any of those in src/ fails here, which no closed-form model can
+closed form. These tests pin the SHIPPED code to that arithmetic: the construction predicates
+(routed-expert and shared-expert flavors), the forced gather_output=False, the zero-embed
+offsets and group selection computed by the real method, the placement of the collective
+completions inside forward(), gradient flow through the pad/unpad helpers, and LoRAMerge's
+group selection. Reverting any of those in src/ fails here, which no closed-form model can
 do. The collectives themselves are replaced by spies; their distributed behaviour needs a real
 process group and was verified manually on 2 GPUs (see the PR).
 """
@@ -30,6 +31,7 @@ import pytest
 import torch
 
 from megatron.bridge.peft.dora import DoRA
+from megatron.bridge.peft.lora import LoRAMerge
 from megatron.bridge.peft.utils import ParallelLinearAdapter, pad_seq_to_mult, unpad_seq_to_mult
 
 
@@ -103,7 +105,7 @@ def test_embed_zero_embeds_the_local_shard_at_the_rank_offset(mock_row, mock_col
     embedded = []
     for rank, shard in enumerate(shards):
         mock_ps.get_expert_tensor_parallel_rank.return_value = rank
-        out = adapter._embed_expert_row_parallel_shard(shard)
+        out = adapter._embed_row_parallel_shard(shard)
         assert out.shape == (5, OUT)
         assert torch.equal(out[:, rank * OUT_SHARD : (rank + 1) * OUT_SHARD], shard)
         mask = torch.ones(OUT, dtype=torch.bool)
@@ -121,13 +123,19 @@ def test_embed_zero_embeds_the_local_shard_at_the_rank_offset(mock_row, mock_col
 def test_expert_row_parallel_predicate_and_gather_flag(mock_row, mock_col, mock_ps):
     """gather_output must be False exactly when the dispatcher will sum the adapter's output."""
     cases = [
-        # (is_expert, input_is_parallel, base_linear_is_parallel) -> (predicate, gather_output)
-        ((True, True, True), (True, False)),
-        ((False, True, True), (False, True)),
-        ((True, False, True), (False, False)),
-        ((True, True, False), (False, True)),
+        # (is_expert, input_is_parallel, base_linear_is_parallel, disable_tp_comm)
+        #   -> (expert_predicate, shared_predicate, gather_output)
+        ((True, True, True, False), (True, False, False)),
+        ((False, True, True, False), (False, False, True)),
+        ((True, False, True, False), (False, False, False)),
+        ((True, True, False, False), (False, False, True)),
+        # Shared-expert fc2 under moe_shared_expert_overlap: base comm suppressed, dense TP
+        # sums the full-width partials downstream.
+        ((False, True, True, True), (False, True, False)),
+        # The same suppression on an expert linear stays the EXPERT flavor.
+        ((True, True, True, True), (True, False, False)),
     ]
-    for (is_expert, iip, blip), (want_predicate, want_gather) in cases:
+    for (is_expert, iip, blip, dtc), (want_expert, want_shared, want_gather) in cases:
         adapter = _make_adapter(
             mock_row,
             mock_col,
@@ -136,10 +144,13 @@ def test_expert_row_parallel_predicate_and_gather_flag(mock_row, mock_col, mock_
             is_expert=is_expert,
             input_is_parallel=iip,
             base_linear_is_parallel=blip,
+            disable_tensor_parallel_comm=dtc,
         )
-        assert adapter._expert_row_parallel is want_predicate, (is_expert, iip, blip)
+        case = (is_expert, iip, blip, dtc)
+        assert adapter._expert_row_parallel is want_expert, case
+        assert adapter._shared_expert_row_parallel is want_shared, case
         # linear_out is always the last ColumnParallelLinear constructed.
-        assert mock_col.call_args.kwargs["gather_output"] is want_gather, (is_expert, iip, blip)
+        assert mock_col.call_args.kwargs["gather_output"] is want_gather, case
 
 
 @patch("megatron.bridge.peft.utils.parallel_state")
@@ -263,3 +274,124 @@ def test_dora_refuses_expert_linears():
     module = torch.nn.Linear(4, 4)
     with pytest.raises(NotImplementedError, match="expert linears"):
         dora.transform(module, name="linear_fc2", prefix="decoder.layers.0.mlp.experts.0")
+
+
+def test_dora_refuses_suppressed_comm_linears():
+    """Shared-expert fc2 under moe_shared_expert_overlap: DoRA's per-rank magnitude norm does
+    not compose with the downstream TP sum, so refuse instead of training silently wrong."""
+    dora = DoRA()
+    module = torch.nn.Linear(4, 4)
+    module.parallel_mode = None
+    with pytest.raises(NotImplementedError, match="suppressed"):
+        dora.transform(module, name="linear_fc2", prefix="decoder.layers.0.mlp.shared_experts")
+
+
+@patch("megatron.bridge.peft.utils.parallel_state")
+@patch("megatron.bridge.peft.utils.ColumnParallelLinear")
+@patch("megatron.bridge.peft.utils.RowParallelLinear")
+def test_shared_expert_embed_uses_the_dense_tp_group(mock_row, mock_col, mock_ps):
+    """The shared-expert flavor must read the DENSE TP rank/size, not the expert group's:
+    SharedExpertMLP.post_forward_comm sums across TP."""
+    tp = 2
+    tp_shard = OUT // tp
+    mock_ps.get_tensor_model_parallel_world_size.return_value = tp
+    # Poison the expert getters: reading them would produce wrong offsets.
+    mock_ps.get_expert_tensor_parallel_world_size.return_value = 1
+    mock_ps.get_expert_tensor_parallel_rank.return_value = 0
+
+    adapter = _make_adapter(
+        mock_row,
+        mock_col,
+        Mock(),
+        Mock(),
+        is_expert=False,
+        input_is_parallel=True,
+        disable_tensor_parallel_comm=True,
+    )
+    assert adapter._shared_expert_row_parallel
+    assert mock_col.call_args.kwargs["gather_output"] is False
+
+    shards = [torch.randn(5, tp_shard, dtype=torch.float64) for _ in range(tp)]
+    embedded = []
+    for rank, shard in enumerate(shards):
+        mock_ps.get_tensor_model_parallel_rank.return_value = rank
+        out = adapter._embed_row_parallel_shard(shard)
+        assert out.shape == (5, OUT)
+        assert torch.equal(out[:, rank * tp_shard : (rank + 1) * tp_shard], shard)
+        embedded.append(out)
+    # post_forward_comm's sum reconstructs the concatenation exactly once.
+    assert torch.equal(sum(embedded), torch.cat(shards, dim=-1))
+
+
+@patch("megatron.bridge.peft.utils.reduce_from_tensor_model_parallel_region")
+@patch("megatron.bridge.peft.utils.copy_to_tensor_model_parallel_region")
+@patch("megatron.bridge.peft.utils.parallel_state")
+@patch("megatron.bridge.peft.utils.ColumnParallelLinear")
+@patch("megatron.bridge.peft.utils.RowParallelLinear")
+def test_forward_wiring_for_shared_expert_row_parallel(mock_row, mock_col, mock_ps, mock_copy, mock_reduce):
+    """The shared-expert flavor needs the embed only: the adapter's linear_in is a normal
+    row-parallel linear (is_expert=False) that performs its own reduction, so neither
+    completion helper may fire, and no expert padding applies."""
+    tp = 2
+    tp_shard = OUT // tp
+    mock_ps.get_tensor_model_parallel_world_size.return_value = tp
+    mock_ps.get_tensor_model_parallel_rank.return_value = 1
+
+    t1 = torch.randn(7, DIM, dtype=torch.float64)
+    t2 = torch.randn(7, tp_shard, dtype=torch.float64)
+    linear_in, linear_out = Mock(return_value=(t1, None)), Mock(return_value=(t2, None))
+    adapter = _make_adapter(
+        mock_row,
+        mock_col,
+        linear_in,
+        linear_out,
+        is_expert=False,
+        input_is_parallel=True,
+        disable_tensor_parallel_comm=True,
+    )
+
+    out = adapter(torch.randn(7, IN, dtype=torch.float64))  # 7 rows: no expert pad applies
+
+    mock_copy.assert_not_called()
+    mock_reduce.assert_not_called()
+    assert linear_in.call_args.args[0].shape[0] == 7
+    assert out.shape == (7, OUT)
+    assert torch.allclose(out[:, 1 * tp_shard : 2 * tp_shard], t2)
+    assert torch.all(out[:, :tp_shard] == 0)
+
+
+@patch("megatron.bridge.peft.lora.dist")
+@patch("megatron.bridge.peft.lora.parallel_state")
+def test_lora_merge_gathers_over_the_expert_group_for_expert_adapters(mock_ps, mock_dist):
+    """LoRAMerge must size and group its gathers by the adapter's own sharding: the expert
+    TP group for is_expert adapters, the dense TP group otherwise. With TP != ETP the dense
+    settings would misclassify the shapes and merge a wrong (or deadlocked) weight."""
+    etp, tp = 2, 4
+    dense_group, expert_group = object(), object()
+    mock_ps.get_tensor_model_parallel_world_size.return_value = tp
+    mock_ps.get_tensor_model_parallel_group.return_value = dense_group
+    mock_ps.get_expert_tensor_parallel_world_size.return_value = etp
+    mock_ps.get_expert_tensor_parallel_group.return_value = expert_group
+
+    def fake_all_gather(tensor_list, tensor, group=None):
+        for i in range(len(tensor_list)):
+            tensor_list[i].copy_(tensor)
+
+    mock_dist.all_gather.side_effect = fake_all_gather
+
+    out_features, in_features, dim, alpha = 8, 12, 4, 4
+    base = torch.randn(out_features, in_features // etp, dtype=torch.float64)
+    linear_out = torch.randn(out_features // etp, dim, dtype=torch.float64)  # B shard
+    linear_in = torch.randn(dim, in_features // etp, dtype=torch.float64)  # A shard
+
+    merged = LoRAMerge().merge(base, linear_out, linear_in, alpha, dim, is_expert=True)
+
+    # The row-parallel branch fired over the EXPERT group with ETP chunks.
+    group_used = mock_dist.all_gather.call_args.kwargs.get("group", None)
+    if group_used is None and len(mock_dist.all_gather.call_args.args) > 2:
+        group_used = mock_dist.all_gather.call_args.args[2]
+    assert group_used is expert_group
+    assert len(mock_dist.all_gather.call_args.args[0]) == etp
+
+    expected = base + alpha / dim * (torch.cat([linear_out, linear_out], dim=0) @ linear_in)
+    assert torch.allclose(merged, expected)
