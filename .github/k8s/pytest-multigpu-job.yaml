@@ -1,0 +1,82 @@
+# Ephemeral GPU pod for the gpu-tests workflow. Placeholders (__JOB_NAME__, __RUN_ID__,
+# __RUN_ATTEMPT__) are substituted by .github/workflows/gpu-tests.yml before `kubectl create`.
+#
+# The container just sleeps; the workflow drives everything through `kubectl exec`, so a failing
+# suite is a failing workflow step rather than a pod restart.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: __JOB_NAME__
+  labels:
+    kueue.x-k8s.io/queue-name: farai
+    app.kubernetes.io/name: megatron-bridge-gpu-tests
+    app.kubernetes.io/component: ci
+    ci.github.com/run-id: "__RUN_ID__"
+    ci.github.com/run-attempt: "__RUN_ATTEMPT__"
+spec:
+  suspend: true
+  # 3h wall clock. Both unit suites together ran in ~36 min of timeout budget under upstream CI
+  # (18 min each), so this is generous headroom for a cold image pull plus a slow run.
+  activeDeadlineSeconds: 10800
+  ttlSecondsAfterFinished: 7200
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: megatron-bridge-gpu-tests
+        app.kubernetes.io/component: ci
+        ci.github.com/run-id: "__RUN_ID__"
+        ci.github.com/run-attempt: "__RUN_ATTEMPT__"
+    spec:
+      priorityClassName: interactive
+      tolerations: []
+      volumes:
+        - name: devshm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 16Gi
+        - name: tmp
+          emptyDir: {}
+      containers:
+        - name: test-container
+          image: ghcr.io/alignmentresearch/megatron-bridge:latest
+          imagePullPolicy: Always
+          command:
+            - bash
+            - -c
+            - |
+              set -euo pipefail
+              mkdir -p /tmp/hf_home
+              echo "Kubernetes CI pod is ready for kubectl exec."
+              sleep 10800
+          resources:
+            requests:
+              cpu: "8"
+              # Explicit ephemeral-storage: without it the cluster admission policy injects a
+              # default of 50Gi/GPU (100Gi here). The unit suites are far lighter than the
+              # functional ones (no torch_dist checkpoints, no large HF downloads — see
+              # README.farai.md), but the freshly cloned repo, its submodule, and any uv sync
+              # into the image's venv still land on the writable layer. 100Gi is ample.
+              ephemeral-storage: 100Gi
+              generic-device/gdrdrv: "1"
+              nvidia.com/gpu: "2"
+            limits:
+              ephemeral-storage: 100Gi
+              generic-device/gdrdrv: "1"
+              memory: 160G
+              nvidia.com/gpu: "2"
+          volumeMounts:
+            - name: devshm
+              mountPath: /dev/shm
+            - name: tmp
+              mountPath: /tmp
+          env:
+            # Kept off the shared cluster filesystem and inside the pod's own /tmp, so
+            # concurrent runs cannot race on the same cache.
+            - name: HF_HOME
+              value: /tmp/hf_home
+            - name: OMP_NUM_THREADS
+              value: "8"
+      imagePullSecrets:
+        - name: docker
+      restartPolicy: Never

@@ -1,0 +1,118 @@
+name: GPU Tests Gate
+
+# Auto-satisfies the required `gpu-tests/*` commit status(es) for PRs that only touch files
+# enumerated in the top-level `.testignore` (gitignore syntax). This lets documentation-only /
+# non-code PRs merge without dispatching the GPU suites.
+#
+# Security note: `.testignore` is read from the PR's BASE branch, not the PR head, so a PR cannot
+# exempt its own files by editing `.testignore` in the same PR. Changes to `.testignore` only
+# take effect once merged to the base branch.
+#
+# If ANY changed file is not matched by `.testignore`, this workflow writes no status and leaves
+# the required check unsatisfied, so a real GPU run (`@flamingo run gpu-tests`) is still required
+# before merge.
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+  statuses: write
+
+concurrency:
+  group: gpu-tests-gate-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  gate:
+    name: gpu-tests gate
+    runs-on: ubuntu-latest
+    env:
+      BASE_SHA: ${{ github.event.pull_request.base.sha }}
+      HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+      # Required gpu-tests/* status context(s) to mark success when the PR only touches
+      # .testignore-matched files. Only the full-run context is required for merge; the
+      # per-suite contexts (gpu-tests/core, gpu-tests/diffusion) are opt-in speed-ups and
+      # intentionally NOT listed here. Keep this in sync with the contexts marked required in
+      # branch protection / rulesets.
+      REQUIRED_CONTEXTS: |
+        gpu-tests/default
+    steps:
+      - name: Check out PR (full history)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+
+      - name: Determine whether all changed files are test-ignored
+        id: gate
+        run: |
+          set -euo pipefail
+          python3 -m pip install --quiet 'pathspec>=0.12'
+
+          # Changed files between the merge-base of base..head and head.
+          git fetch --no-tags --quiet origin "$BASE_SHA" "$HEAD_SHA" 2>/dev/null || true
+          CHANGED="$(git diff --name-only "${BASE_SHA}...${HEAD_SHA}")"
+
+          # Read .testignore from the BASE branch (not PR head) to prevent a PR from
+          # self-exempting. Missing/empty -> nothing is ignored.
+          TESTIGNORE="$(git show "${BASE_SHA}:.testignore" 2>/dev/null || true)"
+
+          export CHANGED TESTIGNORE
+          SKIP="$(python3 <<'PY'
+          import os
+          import pathspec
+
+          changed = [l for l in os.environ.get("CHANGED", "").splitlines() if l.strip()]
+          patterns = os.environ.get("TESTIGNORE", "").splitlines()
+          spec = pathspec.PathSpec.from_lines("gitwildmatch", patterns)
+
+          # No .testignore patterns -> never skip. No changed files -> vacuously skip.
+          if not patterns:
+              print("false")
+          elif not changed:
+              print("true")
+          else:
+              unmatched = [f for f in changed if not spec.match_file(f)]
+              for f in unmatched:
+                  print(f"not-ignored: {f}", flush=True)
+              print("true" if not unmatched else "false")
+          PY
+          )"
+
+          # The last line is the boolean; earlier lines (if any) are diagnostics.
+          DECISION="$(printf '%s\n' "$SKIP" | tail -n 1)"
+          printf '%s\n' "$SKIP" | sed '$d' || true
+          echo "Changed files:"
+          printf '%s\n' "$CHANGED"
+          echo "skip=$DECISION" >> "$GITHUB_OUTPUT"
+
+      - name: Mark required contexts successful
+        if: ${{ steps.gate.outputs.skip == 'true' }}
+        uses: actions/github-script@v8
+        env:
+          REQUIRED_CONTEXTS: ${{ env.REQUIRED_CONTEXTS }}
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            const sha = process.env.HEAD_SHA;
+            const contexts = (process.env.REQUIRED_CONTEXTS || "")
+              .split(/\r?\n/)
+              .map((s) => s.trim())
+              .filter(Boolean);
+            for (const ctx of contexts) {
+              await github.rest.repos.createCommitStatus({
+                owner,
+                repo,
+                sha,
+                state: "success",
+                context: ctx,
+                description: "Skipped: only .testignore-matched files changed",
+                target_url: `${process.env.GITHUB_SERVER_URL}/${process.env.GITHUB_REPOSITORY}/actions/runs/${process.env.GITHUB_RUN_ID}`,
+              });
+            }

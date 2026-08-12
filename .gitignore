@@ -92,6 +92,9 @@ instance/
 docs/_build
 docs/apidocs
 docs/skills
+# Doctree cache used by `make docs-live`. sphinx-autobuild watches docs/, so the cache has to
+# live outside it (see the Makefile); multi-GB on this repo, so it must never be committed.
+.doctrees-cache
 
 # PyBuilder
 target/

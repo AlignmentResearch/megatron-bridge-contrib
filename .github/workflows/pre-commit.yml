@@ -1,0 +1,50 @@
+name: pre-commit
+
+# Runs all hooks in .pre-commit-config.yaml against the whole tree. Replaces the lint-check job
+# that upstream carried inside cicd-main.yml, which was removed with the rest of the NVIDIA-only
+# CI (see README.farai.md).
+#
+# pre-commit is installed standalone rather than through `uv run --group dev`: the dev group
+# pulls nvidia-resiliency-ext, and no hook here needs that environment. The hooks are ruff
+# (which pre-commit provisions itself), two file fixers scoped to *.py, and a local bash hook.
+
+on:
+  pull_request:
+  push:
+    branches:
+      - farai/main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pre-commit-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  pre-commit:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          # No submodules: every hook operates on files tracked in this repo, and
+          # 3rdparty/Megatron-LM is excluded by ruff.toml.
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Cache pre-commit hook environments
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pre-commit
+          key: pre-commit-${{ hashFiles('.pre-commit-config.yaml') }}
+
+      - name: Install pre-commit
+        run: python -m pip install --quiet pre-commit==3.6.0
+
+      - name: Run pre-commit
+        run: pre-commit run --all-files --show-diff-on-failure --color=always

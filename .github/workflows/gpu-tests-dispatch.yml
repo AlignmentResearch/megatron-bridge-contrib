@@ -1,0 +1,95 @@
+name: GPU Tests Dispatch
+
+# Comment listener for GPU test runs. GitHub only evaluates `issue_comment` workflows from the
+# repository default branch, so this file must exist on farai/main before any comment can
+# trigger it.
+#
+# It validates the comment, resolves the PR head branch/SHA, and starts the requested workflow
+# with workflow_dispatch at the PR branch ref. It writes no commit status — the dispatched
+# workflow owns its own pending -> success/failure status against head_sha.
+
+on:
+  issue_comment:
+    types:
+      - created
+
+permissions:
+  actions: write
+  contents: read
+  issues: write
+  pull-requests: write
+
+jobs:
+  dispatch:
+    # Only PR comments, only ones starting with the trigger phrase, and only from users with
+    # write access — the dispatched workflow uses repository secrets.
+    if: >
+      github.event.issue.pull_request &&
+      startsWith(github.event.comment.body, '@flamingo run ') &&
+      contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.comment.author_association)
+    name: Dispatch workflow
+    runs-on: ubuntu-latest
+    steps:
+      - name: Dispatch requested workflow
+        uses: actions/github-script@v8
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            const pullNumber = context.payload.issue.number;
+            const commentId = context.payload.comment.id;
+
+            // GitHub reactions have no literal checkmark/x, so use thumbs up/down.
+            const react = (content) =>
+              github.rest.reactions.createForIssueComment({
+                owner,
+                repo,
+                comment_id: commentId,
+                content,
+              });
+
+            // Parse "@flamingo run <workflow> [args...]" from the first line of the comment.
+            const firstLine = context.payload.comment.body.split(/\r?\n/)[0].trim();
+            const match = firstLine.match(/^@flamingo\s+run\s+(\S+)\s*(.*)$/);
+            if (!match) {
+              await react("-1");
+              core.setFailed("Usage: @flamingo run <workflow> [args...]");
+              return;
+            }
+            const workflowName = match[1];
+            const wfArgs = match[2].trim();
+            const workflowFile = /\.ya?ml$/.test(workflowName)
+              ? workflowName
+              : `${workflowName}.yml`;
+
+            const { data: pull } = await github.rest.pulls.get({
+              owner,
+              repo,
+              pull_number: pullNumber,
+            });
+
+            if (pull.head.repo.full_name !== context.payload.repository.full_name) {
+              await react("-1");
+              core.setFailed("Cannot dispatch workflows for forked PR branches.");
+              return;
+            }
+
+            try {
+              await github.rest.actions.createWorkflowDispatch({
+                owner,
+                repo,
+                workflow_id: workflowFile,
+                ref: pull.head.ref,
+                inputs: {
+                  wf_args: wfArgs,
+                  pr_number: String(pull.number),
+                  head_sha: pull.head.sha,
+                  head_repo: pull.head.repo.full_name,
+                },
+              });
+            } catch (error) {
+              await react("-1");
+              core.setFailed(`Failed to dispatch ${workflowFile}: ${error.message}`);
+              return;
+            }
+
+            await react("+1");

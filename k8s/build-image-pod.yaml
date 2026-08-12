@@ -1,0 +1,78 @@
+# Ephemeral builder Job for docker/Dockerfile.ci on the FAR.AI "flamingo" cluster.
+#
+# Created and torn down by tools/build_image_on_flamingo.sh (invoked by `make image-remote`).
+# The buildkitd service (buildkitd.buildkitd.svc.cluster.local:1234) is only reachable from
+# inside the cluster, so the build must run from a pod. This container just sleeps; the script
+# syncs the working tree into it, then execs `docker buildx build --push` against the shared
+# remote BuildKit, then deletes this Job.
+#
+# The heavy work (DeepEP compile + full uv sync) happens on the remote BuildKit, not in this pod,
+# so its own resource requests stay small.
+#
+# Cluster prerequisites in the target namespace:
+#   - secret buildkit-client-certs      (ca.crt/tls.crt/tls.key)   mTLS to buildkitd
+#   - secret __GHCR_SECRET_NAME__ (__GHCR_SECRET_KEY__)  a user PAT with write:packages, used
+#       both to `docker login ghcr.io` for the push (the shared buildkit-ghcr-auth secret is
+#       read-only) and as the GH_TOKEN build secret Dockerfile.ci mounts.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: __JOB_NAME__
+  labels:
+    kueue.x-k8s.io/queue-name: farai
+spec:
+  backoffLimit: 0
+  suspend: true                  # kueue unsuspends on admission
+  ttlSecondsAfterFinished: 600   # backstop cleanup if the script can't delete it
+  template:
+    metadata:
+      name: __JOB_NAME__
+      labels:
+        kueue.x-k8s.io/queue-name: farai
+    spec:
+      restartPolicy: Never
+      priorityClassName: __PRIORITY__
+      containers:
+        - name: builder
+          image: docker:27-cli       # docker CLI + buildx plugin; no local dockerd needed (remote driver)
+          command: ["sleep", "infinity"]
+          env:
+            # Mounted by Dockerfile.ci's `RUN --mount=type=secret,id=GH_TOKEN`. Same PAT as the
+            # push credential below.
+            - name: GH_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: __GHCR_SECRET_NAME__
+                  key: __GHCR_SECRET_KEY__
+            # GHCR push credential — a user PAT with write:packages, from the user's own secret.
+            # The shared buildkit-ghcr-auth secret is read-only, so the build `docker login`s with
+            # this instead before pushing. The script preflights that this secret/key exists.
+            - name: GHCR_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: __GHCR_SECRET_NAME__
+                  key: __GHCR_SECRET_KEY__
+            - name: GHCR_USER
+              value: __GHCR_USER__
+            # Writable DOCKER_CONFIG (not a read-only secret mount) so `docker login` can write
+            # the GHCR auth, and buildx can store its builder definitions.
+            - name: DOCKER_CONFIG
+              value: /root/.docker
+          resources:
+            requests:
+              cpu: "2"
+              memory: "8Gi"
+            limits:
+              memory: "8Gi"
+          volumeMounts:
+            - name: buildkit-certs
+              mountPath: /etc/buildkit-certs
+              readOnly: true
+            - name: workspace
+              mountPath: /build
+      volumes:
+        - name: buildkit-certs
+          secret:
+            secretName: buildkit-client-certs
+        - name: workspace
+          emptyDir: {}

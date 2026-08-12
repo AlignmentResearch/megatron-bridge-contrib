@@ -1,0 +1,46 @@
+# Files that do NOT require the GPU test suites to run before merging.
+# Uses .gitignore pattern syntax. A PR whose changed files are ALL matched here has its required
+# gpu-tests/* status auto-marked successful by the "GPU Tests Gate" workflow
+# (.github/workflows/gpu-tests-gate.yml).
+#
+# This file is evaluated from the BASE branch, so edits here only take effect after they merge.
+# Keep entries conservative: anything that can affect runtime behavior or the unit suites should
+# NOT be listed.
+
+# Documentation
+docs/
+*.md
+LICENSE
+CHANGELOG.md
+
+# Agent / assistant configuration and skills
+.claude/
+.agents/
+skills/
+
+# Dev tooling and repo meta
+.gitignore
+.gitmodules
+.testignore
+.pre-commit-config.yaml
+ruff.toml
+codecov.yml
+
+# Workflows with no bearing on the GPU suite. Listed FILE BY FILE, deliberately:
+# .github/ also holds gpu-tests.yml, gpu-tests-dispatch.yml, gpu-tests-gate.yml and
+# k8s/pytest-multigpu-job.yaml, which define, dispatch and configure the suite itself.
+# Ignoring the directory and negating those back out does NOT work — gitignore cannot re-include
+# a path under an excluded directory — so a PR editing the test harness would skip the tests it
+# just changed. Add individual files here, never .github/.
+.github/workflows/pre-commit.yml
+.github/workflows/detect-secrets.yml
+.github/workflows/link-check.yml
+.github/workflows/README.md
+.github/ISSUE_TEMPLATE/
+.github/PULL_REQUEST_TEMPLATE.md
+
+# Tests that FAR.AI CI does not run. The functional suites depend on NVIDIA's pre-populated
+# /home/TestData volume, and the gb200 launch scripts target ARM64 hardware we do not have;
+# neither is wired into any workflow here, so changing them cannot affect a CI result.
+# Revisit both entries if the functional or GB200 suites are ever enabled.
+tests/functional_tests/

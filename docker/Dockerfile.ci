@@ -54,4 +54,14 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     fi && \
     uv cache prune ${UV_CACHE_PRUNE_ARGS}
 
+# FAR.AI fork patch: rsync for the remote test runner (tools/test_on_flamingo.sh).
+# That script syncs your working tree into a GPU pod over a `kubectl exec` transport, which needs
+# rsync on BOTH ends — it runs `rsync --server` inside this container. Without it the script falls
+# back to a tar stream that re-sends the whole tree (~258 MB including .git) on every run; rsync
+# makes it incremental. Placed last so adding it does not invalidate the uv sync cache above.
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends rsync && \
+    apt-get clean && \
+    rm -rf /var/lib/apt/lists/*
+
 COPY . /opt/Megatron-Bridge

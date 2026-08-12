@@ -1,0 +1,431 @@
+name: GPU Tests
+
+# Dynamic run title for dispatched runs (e.g. "gpu-tests core"). This is the run-level title,
+# not a check name, so it renders normally on the skipped self-registration run below.
+run-name: gpu-tests ${{ inputs.wf_args }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      wf_args:
+        description: Space-separated arguments passed to this workflow.
+        required: false
+        default: ""
+        type: string
+      pr_number:
+        description: Pull request number that requested this run.
+        required: true
+        type: string
+      head_sha:
+        description: Pull request head SHA to test and update with a status.
+        required: true
+        type: string
+      head_repo:
+        description: Pull request head repository.
+        required: true
+        type: string
+  # Self-registration only: workflow_dispatch via the REST API 404s until GitHub has registered
+  # a workflow, which happens after it runs once from any trigger. This runs (with all jobs
+  # skipped) whenever a PR changes this file, so the dispatcher can target a PR branch's version
+  # before it lands on farai/main. It does NOT run the tests; see the job-level `if` guard.
+  pull_request:
+    paths:
+      - .github/workflows/gpu-tests.yml
+
+permissions:
+  contents: read
+  statuses: write
+
+jobs:
+  gpu-tests:
+    # Only the dispatched run executes the tests; the pull_request event above exists purely to
+    # register the workflow.
+    if: github.event_name == 'workflow_dispatch'
+    name: gpu-tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    env:
+      K8S_CLUSTER_URL: https://h100-tailscale.cluster.far.ai:6443
+      K8S_NAMESPACE: ci
+      K8S_SERVICE_ACCOUNT_NAME: ci-job-manager
+      K8S_SERVICE_ACCOUNT_NAMESPACE: ci
+      WF_ARGS: ${{ inputs.wf_args }}
+      PR_HEAD_SHA: ${{ inputs.head_sha }}
+      PR_HEAD_REPO: ${{ inputs.head_repo }}
+      # Path the PR code is cloned to inside the pod. Deliberately NOT /opt/Megatron-Bridge:
+      # the image bakes a copy of the build-time tree there, and we want the PR's code.
+      REPO_DIR: /opt/megatron-bridge-ci
+    steps:
+      - name: Compute test metadata
+        run: |
+          set -euo pipefail
+          ARGS="${WF_ARGS:-}"
+          if [ -n "$ARGS" ]; then
+            SLUG="$(printf '%s' "$ARGS" | tr '[:upper:]' '[:lower:]' | tr -cs 'a-z0-9' '-' | sed -e 's/^-//' -e 's/-$//')"
+            NAME="gpu-tests $ARGS"
+          else
+            SLUG="default"
+            NAME="gpu-tests"
+          fi
+          # Suite selection. No arg runs both unit suites. A recognized suite name runs only
+          # that one, under its own status context (gpu-tests/<suite>), so it does NOT satisfy
+          # the required gpu-tests/default. An unrecognized arg fails loudly rather than
+          # silently downgrading to an easier run.
+          FIRST_TOKEN="$(printf '%s' "$ARGS" | awk '{print $1}')"
+          TEST_SUITE=""
+          case "$FIRST_TOKEN" in
+            "") ;;
+            core|diffusion) TEST_SUITE="$FIRST_TOKEN" ;;
+            *)
+              echo "::error::Unrecognized gpu-tests argument '$FIRST_TOKEN'. Valid suites: core, diffusion. Use '@flamingo run gpu-tests' with no argument to run both." >&2
+              exit 1
+              ;;
+          esac
+          {
+            echo "TEST_SLUG=$SLUG"
+            echo "TEST_NAME=$NAME"
+            echo "TEST_SUITE=$TEST_SUITE"
+            echo "STATUS_CONTEXT=gpu-tests/$SLUG"
+            echo "K8S_JOB_NAME_PREFIX=megatron-bridge-$SLUG"
+          } >> "$GITHUB_ENV"
+
+      - name: Set pending commit status
+        uses: actions/github-script@v8
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            await github.rest.repos.createCommitStatus({
+              owner,
+              repo,
+              sha: process.env.PR_HEAD_SHA,
+              state: "pending",
+              context: process.env.STATUS_CONTEXT,
+              description: `${process.env.TEST_NAME} running`,
+              target_url: `${process.env.GITHUB_SERVER_URL}/${process.env.GITHUB_REPOSITORY}/actions/runs/${process.env.GITHUB_RUN_ID}`,
+            });
+
+      - name: Check out pull request commit
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.head_repo }}
+          ref: ${{ inputs.head_sha }}
+          persist-credentials: false
+
+      - name: Install kubectl
+        run: |
+          set -euo pipefail
+          mkdir -p "$HOME/.local/bin"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          export PATH="$HOME/.local/bin:$PATH"
+
+          OS="$(uname | tr '[:upper:]' '[:lower:]')"
+          ARCH="$(uname -m | sed -e 's/x86_64/amd64/' -e 's/aarch64/arm64/')"
+          KUBECTL_VERSION="$(
+            curl --insecure --silent --show-error "$K8S_CLUSTER_URL/version" \
+              | python3 -c 'import json, sys; print(json.load(sys.stdin)["gitVersion"])'
+          )"
+          curl --fail --show-error --location \
+            -o "$HOME/.local/bin/kubectl" \
+            "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/${OS}/${ARCH}/kubectl"
+          chmod +x "$HOME/.local/bin/kubectl"
+
+      - name: Echo kubectl version
+        run: kubectl version --client=true
+
+      - name: Configure kubectl
+        env:
+          GITHUB_PAT: ${{ secrets.CI_GITHUB_PAT }}
+          K8S_TOKEN: ${{ secrets.K8S_TOKEN }}
+        run: |
+          set -euo pipefail
+          : "${K8S_TOKEN:?K8S_TOKEN must be set as a GitHub Actions secret}"
+          : "${GITHUB_PAT:?CI_GITHUB_PAT must be set as a GitHub Actions secret}"
+
+          # Fail fast instead of blocking on an interactive credential prompt if the token is
+          # rejected.
+          export GIT_TERMINAL_PROMPT=0
+
+          mkdir -p "$HOME/.kube"
+          touch "$HOME/.kube/config"
+          FLAMINGO_ROOT=/tmp/flamingo
+          rm -rf "$FLAMINGO_ROOT"
+          git clone --depth 1 "https://x-access-token:${GITHUB_PAT}@github.com/AlignmentResearch/flamingo.git" "$FLAMINGO_ROOT"
+          git -C "$FLAMINGO_ROOT" remote set-url origin https://github.com/AlignmentResearch/flamingo.git
+
+          TOKEN_FILE="$HOME/.kube/ci-job-manager-token"
+          printf '%s' "$K8S_TOKEN" > "$TOKEN_FILE"
+          chmod 600 "$TOKEN_FILE"
+          K8S_USER="system:serviceaccount:${K8S_SERVICE_ACCOUNT_NAMESPACE}:${K8S_SERVICE_ACCOUNT_NAME}"
+          export KUBECONFIG="$HOME/.kube/config:$HOME/.kube/far-config:$FLAMINGO_ROOT/kubeconfig"
+          echo "KUBECONFIG=$KUBECONFIG" >> "$GITHUB_ENV"
+          {
+            printf '%s\n' 'apiVersion: v1'
+            printf '%s\n' 'kind: Config'
+            printf '%s\n' 'users:'
+            printf '%s\n' "- name: ${K8S_USER}"
+            printf '%s\n' '  user:'
+            printf '%s\n' "    tokenFile: ${TOKEN_FILE}"
+            printf '%s\n' 'contexts:'
+            printf '%s\n' '- context:'
+            printf '%s\n' '    cluster: h100'
+            printf '%s\n' "    namespace: ${K8S_NAMESPACE}"
+            printf '%s\n' "    user: ${K8S_USER}"
+            printf '%s\n' '  name: h100-ci'
+            printf '%s\n' 'current-context: h100-ci'
+          } > "$HOME/.kube/far-config"
+          chmod 600 "$HOME/.kube/config" "$HOME/.kube/far-config"
+          kubectl config use-context h100-ci
+          kubectl get jobs --namespace "$K8S_NAMESPACE"
+
+      - name: Create and connect to Kubernetes job
+        run: |
+          set -euo pipefail
+
+          K8S_JOB_SUFFIX="$(od -An -N4 -tx1 /dev/urandom | tr -d ' \n')"
+          K8S_JOB_NAME="${K8S_JOB_NAME_PREFIX}-${K8S_JOB_SUFFIX}"
+          echo "K8S_JOB_NAME=$K8S_JOB_NAME" >> "$GITHUB_ENV"
+
+          MANIFEST=/tmp/pytest-multigpu-job.yaml
+          sed \
+            -e "s|__JOB_NAME__|${K8S_JOB_NAME}|g" \
+            -e "s|__RUN_ID__|${GITHUB_RUN_ID}|g" \
+            -e "s|__RUN_ATTEMPT__|${GITHUB_RUN_ATTEMPT}|g" \
+            .github/k8s/pytest-multigpu-job.yaml > "$MANIFEST"
+
+          MAX_CREATE_ATTEMPTS=720
+          CREATED=false
+          for i in $(seq 1 "$MAX_CREATE_ATTEMPTS"); do
+            echo "Attempt $i of $MAX_CREATE_ATTEMPTS to create Kubernetes job $K8S_JOB_NAME..."
+            if CREATE_OUTPUT="$(kubectl create -f "$MANIFEST" 2>&1)"; then
+              echo "$CREATE_OUTPUT"
+              CREATED=true
+              break
+            fi
+
+            echo "$CREATE_OUTPUT"
+            echo "Job creation failed; retrying in 30 seconds."
+            sleep 30
+          done
+
+          if [ "$CREATED" != "true" ]; then
+            echo "Failed to create Kubernetes job after $MAX_CREATE_ATTEMPTS attempts."
+            exit 1
+          fi
+
+          MAX_READY_ATTEMPTS=240
+          READY=false
+          for i in $(seq 1 "$MAX_READY_ATTEMPTS"); do
+            K8S_POD_NAME="$(
+              kubectl get pod \
+                -l "job-name=${K8S_JOB_NAME}" \
+                -o jsonpath='{.items[0].metadata.name}' 2>/dev/null \
+                || true
+            )"
+
+            if [ -n "$K8S_POD_NAME" ]; then
+              POD_PHASE="$(kubectl get pod "$K8S_POD_NAME" -o jsonpath='{.status.phase}' || true)"
+              echo "Waiting for pod $K8S_POD_NAME to be ready; phase is ${POD_PHASE:-unknown}."
+              if kubectl wait --for=condition=Ready "pod/${K8S_POD_NAME}" --timeout=20s; then
+                READY=true
+                break
+              fi
+
+              if [ "$POD_PHASE" = "Failed" ] || [ "$POD_PHASE" = "Succeeded" ]; then
+                kubectl describe pod "$K8S_POD_NAME" || true
+                kubectl logs "$K8S_POD_NAME" -c test-container || true
+                echo "Pod exited before it became ready."
+                exit 1
+              fi
+            else
+              echo "No pod exists for $K8S_JOB_NAME yet; waiting for Kueue admission or scheduling."
+              kubectl get job "$K8S_JOB_NAME" -o wide || true
+            fi
+
+            JOB_CONDITIONS="$(
+              kubectl get job "$K8S_JOB_NAME" \
+                -o jsonpath='{range .status.conditions[?(@.status=="True")]}{.type}{"\n"}{end}' \
+                || true
+            )"
+            if echo "$JOB_CONDITIONS" | grep -q '^Failed$'; then
+              kubectl describe job "$K8S_JOB_NAME" || true
+              echo "Job failed before pod readiness."
+              exit 1
+            fi
+
+            sleep 10
+          done
+
+          if [ "$READY" != "true" ]; then
+            kubectl describe job "$K8S_JOB_NAME" || true
+            kubectl describe pod -l "job-name=${K8S_JOB_NAME}" || true
+            echo "Timed out waiting for Kubernetes pod readiness."
+            exit 1
+          fi
+
+          echo "K8S_POD_NAME=$K8S_POD_NAME" >> "$GITHUB_ENV"
+          kubectl exec "$K8S_POD_NAME" -c test-container -- bash -c "echo 'Connection successful'"
+
+      - name: Clone Megatron-Bridge at the PR commit in the Kubernetes job
+        env:
+          GITHUB_PAT: ${{ secrets.CI_GITHUB_PAT }}
+        run: |
+          set -euo pipefail
+          : "${GITHUB_PAT:?CI_GITHUB_PAT must be set as a GitHub Actions secret}"
+          # Stream the PAT over stdin (kubectl exec -i) rather than placing it in the exec argv,
+          # so the literal token never lands in the apiserver /exec audit log. Inside the pod we
+          # authenticate with an in-memory http.extraHeader (git -c, never persisted) scoped to
+          # github.com and clone the plain URL, so the token is never written to .git/config and
+          # is not sent to any non-GitHub host.
+          #
+          # Submodules are mandatory here, not an optimization: uv resolves megatron-core from
+          # 3rdparty/Megatron-LM, and `uv run` fails outright without it.
+          printf '%s\n' "$GITHUB_PAT" | kubectl exec -i "$K8S_POD_NAME" -c test-container -- \
+            env HEAD_REPO="$PR_HEAD_REPO" HEAD_SHA="$PR_HEAD_SHA" REPO_DIR="$REPO_DIR" bash -c '
+              set -euo pipefail
+              export GIT_TERMINAL_PROMPT=0
+              IFS= read -r GITHUB_PAT
+              AUTH_HEADER="Authorization: Basic $(printf "x-access-token:%s" "$GITHUB_PAT" | base64 | tr -d "\n")"
+              unset GITHUB_PAT
+              for i in 1 2 3 4 5; do
+                echo "Clone attempt $i for ${HEAD_REPO}@${HEAD_SHA}..."
+                rm -rf "$REPO_DIR"
+                if git -c http.https://github.com/.extraheader="$AUTH_HEADER" clone --verbose "https://github.com/${HEAD_REPO}.git" "$REPO_DIR" \
+                  && cd "$REPO_DIR" \
+                  && git -c http.https://github.com/.extraheader="$AUTH_HEADER" fetch --verbose origin "$HEAD_SHA" \
+                  && git checkout "$HEAD_SHA" \
+                  && git -c http.https://github.com/.extraheader="$AUTH_HEADER" submodule update --init --recursive; then
+                  echo "Checkout complete at $(git rev-parse HEAD)"
+                  exit 0
+                fi
+                echo "Clone attempt $i failed; retrying in 5s..."
+                sleep 5
+              done
+              echo "Failed to clone after 5 attempts."
+              exit 1
+            '
+
+      - name: Show GPU and environment state
+        run: |
+          set -euo pipefail
+          kubectl exec "$K8S_POD_NAME" -c test-container -- bash -c '
+            set -euo pipefail
+            nvidia-smi
+            echo "UV_PROJECT_ENVIRONMENT=${UV_PROJECT_ENVIRONMENT:-unset}"
+            uv --version
+          '
+
+      # The two suites run as separate steps so they report independently rather than passing or
+      # failing as one block. `!cancelled()` lets the second still run when the first failed.
+      #
+      # No TRANSFORMERS_OFFLINE / HF_HUB_OFFLINE here, unlike upstream: the unit suite makes
+      # exactly one live Hub call (tests/unit_tests/training/test_tokenizer.py downloads the
+      # ungated bert-base-uncased tokenizer, a few hundred KB), and everything else that looks
+      # like a Hub call is mocked. Running online avoids having to seed a cache. If Hub outages
+      # ever make this flaky, bake that tokenizer into the image and restore the offline vars.
+      - name: "Unit suite: core"
+        id: suite-core
+        if: ${{ !cancelled() && (env.TEST_SUITE == '' || env.TEST_SUITE == 'core') }}
+        run: |
+          set -euo pipefail
+          kubectl exec "$K8S_POD_NAME" -c test-container -- \
+            env REPO_DIR="$REPO_DIR" bash -c '
+              set -euo pipefail
+              export CI=true
+              cd "$REPO_DIR"
+              bash tests/unit_tests/Launch_Unit_Tests_Core.sh
+            '
+
+      - name: "Unit suite: diffusion"
+        id: suite-diffusion
+        if: ${{ !cancelled() && (env.TEST_SUITE == '' || env.TEST_SUITE == 'diffusion') }}
+        run: |
+          set -euo pipefail
+          kubectl exec "$K8S_POD_NAME" -c test-container -- \
+            env REPO_DIR="$REPO_DIR" bash -c '
+              set -euo pipefail
+              export CI=true
+              cd "$REPO_DIR"
+              bash tests/unit_tests/Launch_Unit_Tests_Diffusion.sh
+            '
+
+      # Both launchers write coverage to $REPO_DIR/.coverage (see the --data-file flag in each).
+      - name: Copy outputs to runner
+        if: always()
+        run: |
+          if [ -z "${K8S_POD_NAME:-}" ]; then
+            echo "No Kubernetes pod name is available; skipping output copy."
+            exit 0
+          fi
+          rm -rf /tmp/outputs
+          mkdir -p /tmp/outputs
+          kubectl cp \
+            "$K8S_NAMESPACE/$K8S_POD_NAME:${REPO_DIR#/}/.coverage" \
+            /tmp/outputs/.coverage \
+            -c test-container \
+            || echo "No coverage data to copy."
+
+      - name: Upload outputs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.TEST_SLUG }}-test-outputs
+          path: /tmp/outputs
+          include-hidden-files: true
+          if-no-files-found: warn
+
+      - name: Tear down Kubernetes job
+        if: always()
+        run: |
+          if [ -z "${K8S_JOB_NAME:-}" ]; then
+            echo "No Kubernetes job name is available; skipping teardown."
+            exit 0
+          fi
+          kubectl delete job "$K8S_JOB_NAME" --wait=true || true
+
+      - name: Set success commit status
+        if: success()
+        uses: actions/github-script@v8
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            await github.rest.repos.createCommitStatus({
+              owner,
+              repo,
+              sha: process.env.PR_HEAD_SHA,
+              state: "success",
+              context: process.env.STATUS_CONTEXT,
+              description: `${process.env.TEST_NAME} passed`,
+              target_url: `${process.env.GITHUB_SERVER_URL}/${process.env.GITHUB_REPOSITORY}/actions/runs/${process.env.GITHUB_RUN_ID}`,
+            });
+
+      - name: Set failure commit status
+        if: failure()
+        uses: actions/github-script@v8
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            await github.rest.repos.createCommitStatus({
+              owner,
+              repo,
+              sha: process.env.PR_HEAD_SHA,
+              state: "failure",
+              context: process.env.STATUS_CONTEXT,
+              description: `${process.env.TEST_NAME} failed`,
+              target_url: `${process.env.GITHUB_SERVER_URL}/${process.env.GITHUB_REPOSITORY}/actions/runs/${process.env.GITHUB_RUN_ID}`,
+            });
+
+      - name: Set error commit status
+        if: cancelled()
+        uses: actions/github-script@v8
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            await github.rest.repos.createCommitStatus({
+              owner,
+              repo,
+              sha: process.env.PR_HEAD_SHA,
+              state: "error",
+              context: process.env.STATUS_CONTEXT,
+              description: `${process.env.TEST_NAME} cancelled`,
+              target_url: `${process.env.GITHUB_SERVER_URL}/${process.env.GITHUB_REPOSITORY}/actions/runs/${process.env.GITHUB_RUN_ID}`,
+            });

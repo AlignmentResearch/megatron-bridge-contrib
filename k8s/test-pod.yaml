@@ -1,0 +1,93 @@
+# Ephemeral GPU test Job for running Megatron-Bridge unit tests on the FAR.AI cluster.
+#
+# Created and torn down by tools/test_on_flamingo.sh (invoked by the `make test-unit-remote`
+# family of targets: test-unit-remote, test-unit-core-remote, test-unit-diffusion-remote).
+#
+# This mirrors the gpu-tests CI pod (.github/k8s/pytest-multigpu-job.yaml): same image and test
+# environment; GPU/CPU/memory are templated from TEST_GPUS (default 2 = CI parity, which is what
+# both unit launchers pin via CUDA_VISIBLE_DEVICES="0,1"). The difference is that instead of
+# cloning the repo at a PR commit, the orchestration script rsyncs the local working tree into
+# the pod and then runs the same launcher scripts the CI workflow runs. The container just
+# sleeps; the script execs into it and tears the Job down on exit.
+#
+# The component=local-dev label is what keeps this tool's jobs distinct from the CI jobs
+# (component=ci) — the script's selector only ever discovers local-dev jobs, so `make
+# test-teardown JOB=all` can never delete a CI run.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: __JOB_NAME__
+  labels:
+    kueue.x-k8s.io/queue-name: farai
+    app.kubernetes.io/name: megatron-bridge-gpu-tests
+    app.kubernetes.io/component: local-dev
+    user: __USER_LABEL__
+    megatron-bridge.farai/user: __USER_LABEL__
+    megatron-bridge.farai/test-suite: __SUITE_LABEL__
+spec:
+  suspend: true                  # kueue unsuspends on admission
+  activeDeadlineSeconds: 21600
+  ttlSecondsAfterFinished: 3600  # backstop cleanup if the script can't delete it
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: megatron-bridge-gpu-tests
+        app.kubernetes.io/component: local-dev
+        user: __USER_LABEL__
+        megatron-bridge.farai/user: __USER_LABEL__
+        megatron-bridge.farai/test-suite: __SUITE_LABEL__
+    spec:
+      priorityClassName: __PRIORITY__
+      tolerations: []
+      volumes:
+        - name: devshm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 16Gi
+        - name: tmp
+          emptyDir: {}
+      containers:
+        - name: test-container
+          image: __IMAGE__
+          imagePullPolicy: __IMAGE_PULL_POLICY__
+          command:
+            - bash
+            - -c
+            - |
+              set -euo pipefail
+              mkdir -p /tmp/hf_home
+              echo "Kubernetes test pod is ready for kubectl exec."
+              sleep 21600
+          resources:
+            requests:
+              cpu: "__TEST_CPU__"
+              ephemeral-storage: __TEST_DISK__
+              generic-device/gdrdrv: "1"
+              nvidia.com/gpu: "__TEST_GPUS__"
+            limits:
+              # Explicit ephemeral-storage LIMIT. We must set one: when it is absent the cluster's
+              # admission policy INJECTS a default of 50Gi/GPU (100Gi at 2 GPUs), and a pod that
+              # crosses it mid-run is evicted with exit 137. Setting it explicitly overrides the
+              # injected default; __TEST_DISK__ is sized in tools/test_on_flamingo.sh. GPU nodes
+              # have multi-TB ephemeral storage, so this reserves a small fraction.
+              ephemeral-storage: __TEST_DISK__
+              generic-device/gdrdrv: "1"
+              memory: __TEST_MEM__
+              nvidia.com/gpu: "__TEST_GPUS__"
+          volumeMounts:
+            - name: devshm
+              mountPath: /dev/shm
+            - name: tmp
+              mountPath: /tmp
+          env:
+            # Kept inside the pod's own /tmp so concurrent runs cannot race on one cache. The unit
+            # suite makes a single small, ungated Hub call (see .github/workflows/README.md), so
+            # no HF_TOKEN and no seeded cache are needed.
+            - name: HF_HOME
+              value: /tmp/hf_home
+            - name: OMP_NUM_THREADS
+              value: "8"
+      imagePullSecrets:
+        - name: docker
+      restartPolicy: Never
