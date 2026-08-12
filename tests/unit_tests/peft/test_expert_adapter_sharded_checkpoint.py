@@ -155,10 +155,16 @@ def _adapter_shardings(rank: Rank, is_expert: bool = True) -> list:
             model_parallel_config=config,
         )
 
+    # Every expert coordinate this rank could be asked for, so the assertions are about what the
+    # adapter does with them rather than about which of them it happens to read.
     with (
         patch.object(parallel_state, "get_expert_model_parallel_rank", return_value=rank.ep),
+        patch.object(parallel_state, "get_expert_model_parallel_world_size", return_value=rank.world.ep_size),
+        patch.object(parallel_state, "get_expert_tensor_parallel_rank", return_value=rank.etp),
+        patch.object(parallel_state, "get_expert_tensor_parallel_world_size", return_value=rank.world.etp_size),
         patch.object(parallel_state, "get_expert_data_parallel_rank", return_value=rank.edp),
         patch.object(parallel_state, "get_expert_data_parallel_world_size", return_value=rank.world.edp_size),
+        patch.object(parallel_state, "get_data_parallel_rank", return_value=rank.dp_rank),
         patch.object(parallel_state, "get_data_parallel_world_size", return_value=rank.dp_size),
     ):
         sharded_state_dict = adapter.sharded_state_dict(prefix=PREFIX)
@@ -216,6 +222,8 @@ def single_rank_process_group():
     [
         # The configuration of the run that this reproduces: TP = ETP = 4, EP = 1, DP = 2.
         pytest.param(World(etp_size=4, ep_size=1, edp_size=2), id="etp4-ep1-edp2"),
+        # The same run without data parallelism, which used to take a separate code path.
+        pytest.param(World(etp_size=4, ep_size=1, edp_size=1), id="etp4-ep1-edp1"),
         # EP alone still has to be told apart, since the adapter key holds no expert index.
         pytest.param(World(etp_size=1, ep_size=4, edp_size=2), id="etp1-ep4-edp2"),
         pytest.param(World(etp_size=2, ep_size=2, edp_size=2), id="etp2-ep2-edp2"),
@@ -255,6 +263,22 @@ def test_expert_tensor_parallel_rank_survives_in_replica_id() -> None:
         assert set(replica_ids) == {f"{PREFIX}linear_in._extra_state", f"{PREFIX}linear_out._extra_state"}
         for key, replica_id in replica_ids.items():
             assert replica_id[1] == rank.etp, f"{key} on {rank} lost the expert-TP rank: {replica_id}"
+
+
+def test_expert_parallel_identity_survives_the_optimizer_truncation() -> None:
+    """Whatever separates EP ranks has to sit in the first two slots of replica_id.
+
+    The distributed optimizer builds its shardings from these, keeping `replica_id[:2]` and
+    overwriting the last slot with its instance id. An EP identity parked in the last slot is
+    therefore erased, and the optimizer state collides on keys where the model state did not.
+    """
+    world = World(etp_size=2, ep_size=2, edp_size=2)
+    heads: dict[str, dict[tuple[int, int], tuple]] = {}
+    for rank in world.ranks():
+        for key, replica_id in _extra_state_replica_ids(_adapter_shardings(rank)).items():
+            heads.setdefault(key, {})[(rank.ep, rank.etp)] = replica_id[:2]
+    for key, by_rank in heads.items():
+        assert len(set(by_rank.values())) == len(by_rank), f"{key} collapses EP/ETP ranks: {by_rank}"
 
 
 def test_non_expert_adapter_keeps_megatron_replica_ids() -> None:

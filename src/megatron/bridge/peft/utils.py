@@ -764,32 +764,37 @@ class ParallelLinearAdapter(nn.Module):
         linear_in_sd = self.linear_in.sharded_state_dict(f"{prefix}linear_in.", sharded_offsets, metadata)
         linear_out_sd = self.linear_out.sharded_state_dict(f"{prefix}linear_out.", sharded_offsets, metadata)
 
-        # Megatron's own grouped expert linear (TEGroupedLinear._sharded_state_dict_grouped) keeps
-        # replica_id[:2] -- (PP, expert-TP) -- exactly as the linear built it and rewrites only the
-        # last slot, to the expert-data-parallel rank. It can leave EP out of replica_id because its
-        # keys already carry the global expert index, so two EP ranks never describe the same shard.
+        # Megatron's grouped expert linear (TEGroupedLinear._sharded_state_dict_grouped) leaves EP
+        # out of replica_id entirely: its keys carry the global expert index, so two EP ranks never
+        # describe the same shard. An adapter key has no expert index -- one ParallelLinearAdapter
+        # spans a rank's whole local expert group -- so without help every EP rank claims the main
+        # replica of one key. That is what this block is for.
         #
-        # An adapter key has no expert index: one ParallelLinearAdapter spans a rank's whole local
-        # expert group. EP therefore has to be folded into replica_id here, or every EP rank claims
-        # the main replica of the same object. Flattening (EP, expert-DP) into the last slot does
-        # that while leaving slot 1 to mean what it means everywhere else in the checkpoint.
+        # Where EP goes is constrained from two sides:
         #
-        # Slot 1 must survive: it is the expert-TP rank for the `_extra_state` ShardedObjects, and a
-        # ShardedObject carries no offsets to tell ETP ranks apart. Overwriting it makes all of them
-        # main replicas of one key, which dist-checkpointing rejects outright with "Duplicate
-        # ShardedObject keys" -- the save raises, so the run dies rather than checkpointing.
+        # - It cannot displace slot 1. For the `_extra_state` ShardedObjects slot 1 holds the
+        #   expert-TP rank, and a ShardedObject carries no offsets to tell ETP ranks apart, so
+        #   overwriting it makes every ETP rank a main replica of the same key. Dist-checkpointing
+        #   rejects that outright -- the save raises and the run dies instead of checkpointing.
+        # - It cannot live in slot 2 either. The distributed optimizer derives its own shardings
+        #   from these, keeping replica_id[:2] and overwriting the last slot with its instance id
+        #   (distrib_optimizer.py, "Set DP corresponding replica_id coordinate to 0"), which would
+        #   erase an EP identity parked there and collide the optimizer state instead.
+        #
+        # So EP and expert-TP share slot 1, flattened. Slot 1 is already the coordinate that
+        # separates ranks holding different pieces of the same key, and at EP=1 the expression
+        # collapses to exactly the expert-TP rank megatron put there. Slot 2 keeps megatron's own
+        # data-parallel replica id untouched.
         if self.is_expert:
             from megatron.core import parallel_state
 
             ep_rank = parallel_state.get_expert_model_parallel_rank()
-            edp_rank = parallel_state.get_expert_data_parallel_rank()
-            edp_size = parallel_state.get_expert_data_parallel_world_size()
-            replication_rank = ep_rank * edp_size + edp_rank
+            etp_size = parallel_state.get_expert_tensor_parallel_world_size()
             for sd in [linear_in_sd, linear_out_sd]:
                 for v in sd.values():
                     if hasattr(v, "replica_id"):
                         old_rid = v.replica_id
-                        v.replica_id = (old_rid[0], old_rid[1], replication_rank)
+                        v.replica_id = (old_rid[0], ep_rank * etp_size + old_rid[1], old_rid[2])
 
         if "linear_fc1" in self.base_linear_name:
             for k, v in linear_out_sd.items():
