@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -18,11 +18,13 @@ The adapter must compute what a merged `(alpha/dim) * B @ A` folded into the bas
 on the forward pass and on both parameter gradients. This exercises the arithmetic the fix
 relies on -- per-rank `A_r @ h_r` summed across the expert-tensor-parallel group, then a
 zero-embedded `B_r @ z` that the dispatcher's cross-ETP sum reassembles exactly once -- without
-needing GPUs or a process group. The distributed behaviour of the real collectives is covered
-by the GPU suite; what is proven here is that the arithmetic those collectives implement is the
-arithmetic a merged weight expresses.
+needing GPUs or a process group. These are closed-form models, not the shipped class: the
+production wiring is covered by test_expert_adapter_wiring.py, and the real collectives were
+verified manually on 2 GPUs (see the PR); no in-repo test drives them.
 
-The token count is deliberately NOT a multiple of ETP, so the pad/unpad path is live.
+The token count is deliberately NOT a multiple of ETP so the algebra cannot depend on
+divisibility. The pad/unpad path itself is not modeled here; its gradient flow is covered in
+test_expert_adapter_wiring.py.
 """
 
 import torch
@@ -59,10 +61,7 @@ def _merged(x, a, b):
 
 def _fixed(x, a, b):
     """Per-rank shards, `A @ h` summed across ETP, `B_r @ z` zero-embedded, dispatcher sums."""
-    z = sum(
-        x[:, r * IN_SHARD : (r + 1) * IN_SHARD] @ a[:, r * IN_SHARD : (r + 1) * IN_SHARD].t()
-        for r in range(ETP)
-    )
+    z = sum(x[:, r * IN_SHARD : (r + 1) * IN_SHARD] @ a[:, r * IN_SHARD : (r + 1) * IN_SHARD].t() for r in range(ETP))
     parts = []
     for r in range(ETP):
         shard = b[r * OUT_SHARD : (r + 1) * OUT_SHARD, :] @ z.t()
@@ -73,13 +72,8 @@ def _fixed(x, a, b):
 
 def _unfixed(x, a, b):
     """`A @ h` left as a per-rank partial, and a gathered delta the dispatcher counts ETP times."""
-    z = [
-        x[:, r * IN_SHARD : (r + 1) * IN_SHARD] @ a[:, r * IN_SHARD : (r + 1) * IN_SHARD].t()
-        for r in range(ETP)
-    ]
-    gathered = torch.cat(
-        [b[r * OUT_SHARD : (r + 1) * OUT_SHARD, :] @ z[r].t() for r in range(ETP)], dim=0
-    ).t()
+    z = [x[:, r * IN_SHARD : (r + 1) * IN_SHARD] @ a[:, r * IN_SHARD : (r + 1) * IN_SHARD].t() for r in range(ETP)]
+    gathered = torch.cat([b[r * OUT_SHARD : (r + 1) * OUT_SHARD, :] @ z[r].t() for r in range(ETP)], dim=0).t()
     return ETP * gathered
 
 
@@ -100,10 +94,5 @@ def test_the_unfixed_arithmetic_is_detected():
     """Negative control. Without it the assertions above cannot be shown to discriminate."""
     ref_da, ref_db = _run(_merged)
     bad_da, bad_db = _run(_unfixed)
-    assert (bad_da - ref_da).abs().max() > 1.0
-    assert (bad_db - ref_db).abs().max() > 1.0
-
-
-def test_the_padding_offsets_stay_inside_the_buffer():
-    for r in range(ETP):
-        assert (ETP - 1) * OUT_SHARD - r * OUT_SHARD >= 0
+    assert (bad_da - ref_da).abs().max() / ref_da.abs().max() > 0.1
+    assert (bad_db - ref_db).abs().max() / ref_db.abs().max() > 0.1

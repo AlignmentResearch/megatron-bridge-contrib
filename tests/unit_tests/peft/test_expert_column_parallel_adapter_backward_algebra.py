@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -14,8 +14,10 @@
 
 """Closed-form check of the expert COLUMN-parallel adapter (experts.linear_fc1) at ETP > 1.
 
-Its forward is exact and its `dL/dB` is already correct, so only `dL/dA` can tell the fixed
-path from the broken one -- which is why a forward-only check calls the broken version green.
+Its forward is exact and its `dL/dB` is already correct, so of the quantities modeled here
+only `dL/dA` can tell the fixed path from the broken one -- which is why a forward-only check
+calls the broken version green. (`dL/dx` also discriminates, but it flows through the
+dispatcher and is out of scope for this file.)
 
 `A` is sharded over the low-rank dim and gathered to a full `z`; `B` is sharded over the output
 and consumes that full `z`, so the true `dL/dz` sums over every rank. `explicit_expert_comm`
@@ -55,23 +57,12 @@ def _reference_grads(x, a0, b0, g):
 
 def _da_from(per_rank_dz, x):
     """`dL/dA_r` is built from rank r's slice of whatever `dL/dz` that rank holds."""
-    return torch.cat(
-        [per_rank_dz[r][:, r * DIM_SHARD : (r + 1) * DIM_SHARD].t() @ x for r in range(ETP)], dim=0
-    )
+    return torch.cat([per_rank_dz[r][:, r * DIM_SHARD : (r + 1) * DIM_SHARD].t() @ x for r in range(ETP)], dim=0)
 
 
 def _local_dz(a0, b0, g):
     shards = [b0[r * OUT_SHARD : (r + 1) * OUT_SHARD, :] for r in range(ETP)]
     return [g[r] @ shards[r] for r in range(ETP)]
-
-
-def test_forward_is_unchanged_by_the_fix():
-    """The fix is backward-only here; a change that moved the forward would be a regression."""
-    x, a, b, _ = _fixtures()
-    z = x @ a.t()
-    for r in range(ETP):
-        shard = b[r * OUT_SHARD : (r + 1) * OUT_SHARD, :]
-        assert torch.allclose(z @ shard.t(), x @ (shard @ a).t(), atol=1e-10)
 
 
 def test_dL_dA_matches_merged_weight_after_the_backward_all_reduce():
