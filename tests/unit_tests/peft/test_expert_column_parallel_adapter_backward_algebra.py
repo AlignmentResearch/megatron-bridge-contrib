@@ -1,57 +1,98 @@
-"""fc1 (expert, column-parallel linear_in): the forward is exact, the BACKWARD is not.
+# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
-A is sharded over the low-rank dim and gathered to a full z; B is sharded over the output and
-consumes that full z, so the true dL/dz is a sum over every rank. explicit_expert_comm forces
-allreduce_dgrad=False on the adapter's linear_out, so without a compensating backward
-all-reduce rank r sees only its own contribution and dL/dA_r loses every cross-rank term.
-`copy_to` (forward identity, backward all-reduce) restores it and leaves the forward alone.
+"""Closed-form check of the expert COLUMN-parallel adapter (experts.linear_fc1) at ETP > 1.
 
-The reference is produced by autograd on the merged-weight formulation, independently of how
-the sharded arms are assembled -- otherwise the patched arm would be compared against its own
+Its forward is exact and its `dL/dB` is already correct, so only `dL/dA` can tell the fixed
+path from the broken one -- which is why a forward-only check calls the broken version green.
+
+`A` is sharded over the low-rank dim and gathered to a full `z`; `B` is sharded over the output
+and consumes that full `z`, so the true `dL/dz` sums over every rank. `explicit_expert_comm`
+forces `allreduce_dgrad=False` on the adapter's `linear_out`, so without a compensating backward
+all-reduce rank r sees only its own term.
+
+The reference comes from autograd on the merged-weight formulation, independently of how the
+sharded arms are assembled -- otherwise the fixed arm would be compared against its own
 definition and could not fail.
 """
+
 import torch
 
-torch.manual_seed(0)
+
 T, IN, DIM, OUT, ETP = 7, 12, 8, 16, 4
-dim_sh, out_sh = DIM // ETP, OUT // ETP
-x = torch.randn(T, IN, dtype=torch.float64)
-A0 = torch.randn(DIM, IN, dtype=torch.float64)
-B0 = torch.randn(OUT, DIM, dtype=torch.float64)
-g = [torch.randn(T, out_sh, dtype=torch.float64) for _ in range(ETP)]
+DIM_SHARD, OUT_SHARD = DIM // ETP, OUT // ETP
+TOL = 1e-12
 
-# ---- reference: autograd through W + B@A, sharded over the output dim ----
-A = A0.clone().requires_grad_(True)
-B = B0.clone().requires_grad_(True)
-outs = [x @ (B[r * out_sh:(r + 1) * out_sh, :] @ A).t() for r in range(ETP)]
-torch.autograd.backward(outs, g)
-ref_dA, ref_dB = A.grad.clone(), B.grad.clone()
 
-Bs = [B0[r * out_sh:(r + 1) * out_sh, :] for r in range(ETP)]
-z = x @ A0.t()                                    # forward all-gather: full and exact
+def _fixtures():
+    x = torch.randn(T, IN, dtype=torch.float64, generator=torch.Generator().manual_seed(0))
+    a = torch.randn(DIM, IN, dtype=torch.float64, generator=torch.Generator().manual_seed(1))
+    b = torch.randn(OUT, DIM, dtype=torch.float64, generator=torch.Generator().manual_seed(2))
+    g = [
+        torch.randn(T, OUT_SHARD, dtype=torch.float64, generator=torch.Generator().manual_seed(10 + r))
+        for r in range(ETP)
+    ]
+    return x, a, b, g
 
-fwd_err = max((z @ Bs[r].t() - x @ (Bs[r] @ A0).t()).abs().max().item() for r in range(ETP))
-print(f"forward (the fix must not move it)  max|err| = {fwd_err:.3e}")
 
-# What rank r's linear_out backward produces locally, before any collective.
-local_dz = [g[r] @ Bs[r] for r in range(ETP)]
+def _reference_grads(x, a0, b0, g):
+    a, b = a0.clone().requires_grad_(True), b0.clone().requires_grad_(True)
+    outs = [x @ (b[r * OUT_SHARD : (r + 1) * OUT_SHARD, :] @ a).t() for r in range(ETP)]
+    torch.autograd.backward(outs, g)
+    return a.grad.clone(), b.grad.clone()
 
-def dA_from(per_rank_dz):
-    """dL/dA_r is built from rank r's slice of whatever dL/dz that rank holds."""
+
+def _da_from(per_rank_dz, x):
+    """`dL/dA_r` is built from rank r's slice of whatever `dL/dz` that rank holds."""
     return torch.cat(
-        [per_rank_dz[r][:, r * dim_sh:(r + 1) * dim_sh].t() @ x for r in range(ETP)], dim=0
+        [per_rank_dz[r][:, r * DIM_SHARD : (r + 1) * DIM_SHARD].t() @ x for r in range(ETP)], dim=0
     )
 
-summed = sum(local_dz)                            # what an all-reduce leaves on every rank
-arms = {
-    "PATCHED (backward all-reduce)": dA_from([summed] * ETP),
-    "UNPATCHED": dA_from(local_dz),
-}
-for name, dA in arms.items():
-    rel = (dA - ref_dA).abs().max().item() / ref_dA.abs().max().item()
-    print(f"{name:32s} dL/dA rel err = {rel:.3e} "
-          f"-> {'matches merged weight' if rel < 1e-12 else 'DIFFERS from merged weight'}")
 
-dB = torch.cat([g[r].t() @ z for r in range(ETP)], dim=0)
-print(f"\ndL/dB rel err = {(dB - ref_dB).abs().max().item() / ref_dB.abs().max().item():.3e} "
-      f"(already correct in both arms: B consumes the full z)")
+def _local_dz(a0, b0, g):
+    shards = [b0[r * OUT_SHARD : (r + 1) * OUT_SHARD, :] for r in range(ETP)]
+    return [g[r] @ shards[r] for r in range(ETP)]
+
+
+def test_forward_is_unchanged_by_the_fix():
+    """The fix is backward-only here; a change that moved the forward would be a regression."""
+    x, a, b, _ = _fixtures()
+    z = x @ a.t()
+    for r in range(ETP):
+        shard = b[r * OUT_SHARD : (r + 1) * OUT_SHARD, :]
+        assert torch.allclose(z @ shard.t(), x @ (shard @ a).t(), atol=1e-10)
+
+
+def test_dL_dA_matches_merged_weight_after_the_backward_all_reduce():
+    x, a, b, g = _fixtures()
+    ref_da, _ = _reference_grads(x, a, b, g)
+    summed = sum(_local_dz(a, b, g))
+    got = _da_from([summed] * ETP, x)
+    assert (got - ref_da).abs().max() / ref_da.abs().max() < TOL
+
+
+def test_dL_dB_was_already_correct():
+    x, a, b, g = _fixtures()
+    _, ref_db = _reference_grads(x, a, b, g)
+    z = x @ a.t()
+    got = torch.cat([g[r].t() @ z for r in range(ETP)], dim=0)
+    assert (got - ref_db).abs().max() / ref_db.abs().max() < TOL
+
+
+def test_without_the_all_reduce_dL_dA_loses_the_cross_rank_terms():
+    """Negative control: the defect this file exists to catch."""
+    x, a, b, g = _fixtures()
+    ref_da, _ = _reference_grads(x, a, b, g)
+    got = _da_from(_local_dz(a, b, g), x)
+    assert (got - ref_da).abs().max() / ref_da.abs().max() > 0.1

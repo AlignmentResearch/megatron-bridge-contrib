@@ -1,54 +1,109 @@
-"""Check the fix's algebra: zero-embed + dispatcher sum == B@(A@x), forward AND gradients.
+# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
-T is deliberately not divisible by ETP so the pad/unpad path is exercised; the pad's adjoint
-is what the `no_grad` removal restores.
+"""Closed-form check of the expert ROW-parallel adapter (experts.linear_fc2) at ETP > 1.
+
+The adapter must compute what a merged `(alpha/dim) * B @ A` folded into the base weight would,
+on the forward pass and on both parameter gradients. This exercises the arithmetic the fix
+relies on -- per-rank `A_r @ h_r` summed across the expert-tensor-parallel group, then a
+zero-embedded `B_r @ z` that the dispatcher's cross-ETP sum reassembles exactly once -- without
+needing GPUs or a process group. The distributed behaviour of the real collectives is covered
+by the GPU suite; what is proven here is that the arithmetic those collectives implement is the
+arithmetic a merged weight expresses.
+
+The token count is deliberately NOT a multiple of ETP, so the pad/unpad path is live.
 """
+
 import torch
 
-torch.manual_seed(0)
+
 T, IN, DIM, OUT, ETP = 7, 12, 4, 8, 4
-in_sh, out_sh = IN // ETP, OUT // ETP
-x = torch.randn(T, IN, dtype=torch.float64)
-g = torch.randn(T, OUT, dtype=torch.float64)
+IN_SHARD, OUT_SHARD = IN // ETP, OUT // ETP
+TOL = 1e-10
 
 
-def fresh():
-    A = torch.randn(DIM, IN, dtype=torch.float64, generator=torch.Generator().manual_seed(1))
-    B = torch.randn(OUT, DIM, dtype=torch.float64, generator=torch.Generator().manual_seed(2))
-    return A.requires_grad_(True), B.requires_grad_(True)
+def _inputs():
+    x = torch.randn(T, IN, dtype=torch.float64, generator=torch.Generator().manual_seed(0))
+    g = torch.randn(T, OUT, dtype=torch.float64, generator=torch.Generator().manual_seed(3))
+    return x, g
 
 
-def run(fn):
-    A, B = fresh()
-    out = fn(A, B)
-    out.backward(g)
-    return out.detach(), A.grad.clone(), B.grad.clone()
+def _params():
+    a = torch.randn(DIM, IN, dtype=torch.float64, generator=torch.Generator().manual_seed(1))
+    b = torch.randn(OUT, DIM, dtype=torch.float64, generator=torch.Generator().manual_seed(2))
+    return a.requires_grad_(True), b.requires_grad_(True)
 
 
-def merged(A, B):
-    return x @ (B @ A).t()
+def _run(build):
+    x, g = _inputs()
+    a, b = _params()
+    build(x, a, b).backward(g)
+    return a.grad.clone(), b.grad.clone()
 
 
-def patched(A, B):
-    z = sum(x[:, r * in_sh:(r + 1) * in_sh] @ A[:, r * in_sh:(r + 1) * in_sh].t() for r in range(ETP))
+def _merged(x, a, b):
+    """The reference: one dense matmul against the merged weight."""
+    return x @ (b @ a).t()
+
+
+def _fixed(x, a, b):
+    """Per-rank shards, `A @ h` summed across ETP, `B_r @ z` zero-embedded, dispatcher sums."""
+    z = sum(
+        x[:, r * IN_SHARD : (r + 1) * IN_SHARD] @ a[:, r * IN_SHARD : (r + 1) * IN_SHARD].t()
+        for r in range(ETP)
+    )
     parts = []
     for r in range(ETP):
-        Br = B[r * out_sh:(r + 1) * out_sh, :]
-        left, right = r * out_sh, (ETP - 1) * out_sh - r * out_sh
-        parts.append(torch.nn.functional.pad(Br @ z.t(), (0, 0, left, right)).t())
+        shard = b[r * OUT_SHARD : (r + 1) * OUT_SHARD, :] @ z.t()
+        left, right = r * OUT_SHARD, (ETP - 1) * OUT_SHARD - r * OUT_SHARD
+        parts.append(torch.nn.functional.pad(shard, (0, 0, left, right)).t())
     return sum(parts)
 
 
-def unpatched(A, B):
-    zs = [x[:, r * in_sh:(r + 1) * in_sh] @ A[:, r * in_sh:(r + 1) * in_sh].t() for r in range(ETP)]
-    full = torch.cat([B[r * out_sh:(r + 1) * out_sh, :] @ zs[r].t() for r in range(ETP)], dim=0).t()
-    return ETP * full
+def _unfixed(x, a, b):
+    """`A @ h` left as a per-rank partial, and a gathered delta the dispatcher counts ETP times."""
+    z = [
+        x[:, r * IN_SHARD : (r + 1) * IN_SHARD] @ a[:, r * IN_SHARD : (r + 1) * IN_SHARD].t()
+        for r in range(ETP)
+    ]
+    gathered = torch.cat(
+        [b[r * OUT_SHARD : (r + 1) * OUT_SHARD, :] @ z[r].t() for r in range(ETP)], dim=0
+    ).t()
+    return ETP * gathered
 
 
-ref, ref_dA, ref_dB = run(merged)
-for name, fn in (("PATCHED", patched), ("UNPATCHED (negative control)", unpatched)):
-    out, dA, dB = run(fn)
-    f, a, b = (out - ref).abs().max(), (dA - ref_dA).abs().max(), (dB - ref_dB).abs().max()
-    print(f"{name:30s} forward {f:.3e}  dL/dA {a:.3e}  dL/dB {b:.3e}")
-    verdict = "matches merged weight" if max(f, a, b) < 1e-10 else "DIFFERS from merged weight"
-    print(f"{'':30s} -> {verdict}")
+def test_forward_matches_merged_weight():
+    x, _ = _inputs()
+    a, b = _params()
+    assert torch.allclose(_fixed(x, a, b), _merged(x, a, b), atol=TOL)
+
+
+def test_parameter_gradients_match_merged_weight():
+    ref_da, ref_db = _run(_merged)
+    got_da, got_db = _run(_fixed)
+    assert torch.allclose(got_da, ref_da, atol=TOL), (got_da - ref_da).abs().max()
+    assert torch.allclose(got_db, ref_db, atol=TOL), (got_db - ref_db).abs().max()
+
+
+def test_the_unfixed_arithmetic_is_detected():
+    """Negative control. Without it the assertions above cannot be shown to discriminate."""
+    ref_da, ref_db = _run(_merged)
+    bad_da, bad_db = _run(_unfixed)
+    assert (bad_da - ref_da).abs().max() > 1.0
+    assert (bad_db - ref_db).abs().max() > 1.0
+
+
+def test_the_padding_offsets_stay_inside_the_buffer():
+    for r in range(ETP):
+        assert (ETP - 1) * OUT_SHARD - r * OUT_SHARD >= 0
