@@ -167,6 +167,9 @@ class LoRA(PEFT, ModuleMatcher):
                 and getattr(module.config, "use_transformer_engine_op_fuser", False)
                 # TP not yet supported
                 and parallel_state.get_tensor_model_parallel_world_size() == 1
+                # TEFusedLoRALinear rebuilds the LoRA branch from raw weights with no
+                # expert-parallel handling, bypassing the adapter's ETP collectives.
+                and not is_expert
             )
 
             logging.info(f"Adding lora to: {full_name}")

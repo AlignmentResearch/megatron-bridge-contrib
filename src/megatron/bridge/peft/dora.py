@@ -21,7 +21,7 @@ from torch import nn
 from megatron.bridge.peft.base import PEFT
 from megatron.bridge.peft.dora_layers import DoRALinear, ParallelLinearDoRAAdapter
 from megatron.bridge.peft.module_matcher import ModuleMatcher
-from megatron.bridge.peft.utils import get_adapter_attributes_from_linear
+from megatron.bridge.peft.utils import get_adapter_attributes_from_linear, is_expert_linear
 
 
 logger = logging.getLogger(__name__)
@@ -90,6 +90,13 @@ class DoRA(PEFT, ModuleMatcher):
 
         if (ans := self.match(m, name, prefix)) is not None:
             (match, full_name) = ans
+            if is_expert_linear(full_name):
+                raise NotImplementedError(
+                    f"DoRA does not support MoE expert linears (matched {full_name}): the DoRA "
+                    "adapter is built without is_expert, so its sharding and collectives do not "
+                    "compose with expert parallelism (TP, ETP, or EP > 1). Exclude expert "
+                    "modules from target_modules to proceed."
+                )
             attrs = get_adapter_attributes_from_linear(m)
             logger.info(f"Adding DoRA to: {full_name}")
             adapter = ParallelLinearDoRAAdapter(
