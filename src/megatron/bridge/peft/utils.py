@@ -764,23 +764,32 @@ class ParallelLinearAdapter(nn.Module):
         linear_in_sd = self.linear_in.sharded_state_dict(f"{prefix}linear_in.", sharded_offsets, metadata)
         linear_out_sd = self.linear_out.sharded_state_dict(f"{prefix}linear_out.", sharded_offsets, metadata)
 
-        # The experts.py code in Megatron-LM set replica_id = (PP, ETP, EDP),
-        # but it will cause errors as mentioned in https://github.com/volcengine/verl/issues/4303,
-        # since adapter weights are not EP sharded and it assumes that it will
-        # replicate along DP modulo EP (sharded by EP)
+        # Megatron's own grouped expert linear (TEGroupedLinear._sharded_state_dict_grouped) keeps
+        # replica_id[:2] -- (PP, expert-TP) -- exactly as the linear built it and rewrites only the
+        # last slot, to the expert-data-parallel rank. It can leave EP out of replica_id because its
+        # keys already carry the global expert index, so two EP ranks never describe the same shard.
+        #
+        # An adapter key has no expert index: one ParallelLinearAdapter spans a rank's whole local
+        # expert group. EP therefore has to be folded into replica_id here, or every EP rank claims
+        # the main replica of the same object. Flattening (EP, expert-DP) into the last slot does
+        # that while leaving slot 1 to mean what it means everywhere else in the checkpoint.
+        #
+        # Slot 1 must survive: it is the expert-TP rank for the `_extra_state` ShardedObjects, and a
+        # ShardedObject carries no offsets to tell ETP ranks apart. Overwriting it makes all of them
+        # main replicas of one key, which dist-checkpointing rejects outright with "Duplicate
+        # ShardedObject keys" -- the save raises, so the run dies rather than checkpointing.
         if self.is_expert:
             from megatron.core import parallel_state
 
             ep_rank = parallel_state.get_expert_model_parallel_rank()
             edp_rank = parallel_state.get_expert_data_parallel_rank()
-            dp_size = parallel_state.get_data_parallel_world_size()
-            # TODO: This modification logic is in question and needs further verification.
-            rank = (ep_rank + 1) * (edp_rank + 1) - 1 if dp_size == 1 else ep_rank
+            edp_size = parallel_state.get_expert_data_parallel_world_size()
+            replication_rank = ep_rank * edp_size + edp_rank
             for sd in [linear_in_sd, linear_out_sd]:
                 for v in sd.values():
                     if hasattr(v, "replica_id"):
                         old_rid = v.replica_id
-                        v.replica_id = (old_rid[0], rank, old_rid[2])
+                        v.replica_id = (old_rid[0], old_rid[1], replication_rank)
 
         if "linear_fc1" in self.base_linear_name:
             for k, v in linear_out_sd.items():
