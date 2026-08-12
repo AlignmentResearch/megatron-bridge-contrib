@@ -534,17 +534,8 @@ class ParallelLinearAdapter(nn.Module):
         # holds the whole weight on every rank and no dispatcher sums its output, so there is no
         # shard to embed and gathering remains right. Overriding it here would emit a delta that
         # is three-quarters zeros at ETP=4.
-        self._expert_row_parallel = bool(
-            is_expert and input_is_parallel and base_linear_is_parallel
-        )
+        self._expert_row_parallel = bool(is_expert and input_is_parallel and base_linear_is_parallel)
         if self._expert_row_parallel:
-            if self.use_a2a and _sequence_parallel:
-                raise ValueError(
-                    "a2a_experimental with sequence parallelism is not supported for expert "
-                    "row-parallel adapters: forward() skips the all-to-all block for experts, "
-                    "so the adapter output would keep a hidden-sharded layout the base's "
-                    "full-width partial cannot absorb."
-                )
             lin_out_gather_output = False
 
         self.linear_out = ColumnParallelLinear(
