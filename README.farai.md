@@ -53,7 +53,7 @@ Every deliberate divergence from upstream, newest last. Elaboration follows the 
 
 Upstream ships 20 workflows built around infrastructure this fork does not have: the `copy-pr-bot` GitHub app (which
 creates the `pull-request/<N>` branches every upstream CI trigger keys on), self-hosted H100 and GB200 runner pools,
-NVIDIA container registries, and a long list of org secrets. 18 of them could never run here.
+NVIDIA container registries, and a long list of org secrets. 19 of them could never run here.
 
 Several were not merely inert. `cicd-approve-test-queue.yml` ran on a `*/5` cron — roughly 288 empty workflow runs a
 day. `dependabot.yml` called a reusable workflow that pushes directly to the default branch and deletes remote
@@ -70,15 +70,17 @@ earlier upstream base changed which files existed, so the prune commit's deletio
 
 Note `main` here is the clean upstream mirror branch, so the first two were genuinely reachable rather than dormant.
 
-Two upstream workflows survive because they need no org secrets and no self-hosted runners:
+One upstream workflow survives, because it needs no org secrets and no self-hosted runners:
 
 | Workflow | Trigger | Role |
 |---|---|---|
 | `detect-secrets.yml` | every PR | secret scanning; a thin caller of NVIDIA's `FW-CI-templates/_secrets-detector.yml`, with audited findings allowlisted in `.github/workflows/config/.secrets.baseline` |
-| `link-check.yml` | every PR, weekly | external link checking across `docs/**/*.md` |
 
-`link-check.yml` was rescoped to the Sphinx sources (upstream also pointed it at the Fern `.mdx` tree). `CODEOWNERS`
-was removed — every rule targeted NVIDIA teams that do not exist in this org, so it silently matched nobody.
+`link-check.yml` went too. It crawled external URLs in `docs/**/*.md` on every PR — upstream content that upstream
+already link-checks on its own repo — while never covering the fork-specific markdown we actually write, since the
+lychee args were scoped to `docs/`. With `fail: true` it also put every unrelated PR at the mercy of third-party
+sites being reachable. `CODEOWNERS` was removed too — every rule targeted NVIDIA teams that do not exist in this
+org, so it silently matched nobody.
 
 ### 2. Lint CI on GitHub-hosted runners
 

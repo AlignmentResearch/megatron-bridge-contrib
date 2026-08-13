@@ -38,7 +38,6 @@ codecov.yml
 # just changed. Add individual files here, never .github/.
 .github/workflows/pre-commit.yml
 .github/workflows/detect-secrets.yml
-.github/workflows/link-check.yml
 .github/workflows/fork-base.yml
 .github/workflows/README.md
 .github/ISSUE_TEMPLATE/
