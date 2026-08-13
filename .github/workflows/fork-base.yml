@@ -59,5 +59,19 @@ jobs:
           git remote add upstream "$url"
           git fetch --filter=blob:none --no-tags upstream "$branch:refs/remotes/upstream/$branch"
 
-      - name: Check manifest and pinned dependencies
-        run: python3 tools/fork_base.py --check
+      - name: Check manifest, pinned dependencies, and history shape
+        env:
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
+          HEAD_REF: ${{ github.head_ref }}
+        run: |
+          set -euo pipefail
+          args=()
+          # On a PR, also require that the base moved FORWARD relative to the target branch, and
+          # that a sync/upstream-<date>-<sha> branch name matches the base it claims. Both need
+          # the target branch's manifest, so they only apply here — a push has nothing to compare
+          # against.
+          if [ -n "${BASE_REF:-}" ]; then
+            git fetch --filter=blob:none --no-tags origin "$BASE_REF:refs/remotes/origin/$BASE_REF"
+            args+=(--against "origin/$BASE_REF" --branch-name "$HEAD_REF")
+          fi
+          python3 tools/fork_base.py --check ${args[@]+"${args[@]}"}

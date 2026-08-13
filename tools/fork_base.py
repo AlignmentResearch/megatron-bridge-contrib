@@ -29,7 +29,7 @@ Consumers commonly declare submodules `shallow = true`, so the dependency usuall
 — hence each fork records its own base in `.fork-base.json`, and `--check` re-derives it so the
 record cannot drift silently.
 
-`--check` enforces four things:
+`--check` enforces four COMPATIBILITY rules:
 
   1. `.fork-base.json` still matches `merge-base(HEAD, upstream/<branch>)`.
   2. Every pinned submodule is compatible: a patched dependency's recorded base equals the commit
@@ -43,6 +43,19 @@ record cannot drift silently.
 
 Repos with no submodules simply have nothing to do for 2-4.
 
+It also enforces the SHAPE of history, which the compatibility rules assume but cannot see:
+
+  5. The patch series is linear. No merge may pull upstream history in sideways — such a merge
+     moves the base without the tree necessarily following, because conflict resolution may have
+     dropped upstream hunks — and by default internal merges are refused too, since a plain rebase
+     drops their resolutions and makes replaying onto a new base expensive. `--allow-merges`
+     downgrades the second half for a fork that is not linear yet; an upstream merge always fails.
+  6. Exactly one merge-base with upstream — otherwise `git merge-base` picks arbitrarily and the
+     recorded base is non-deterministic.
+  7. The base is a genuine upstream commit (an ancestor of the upstream branch).
+  8. With `--against <ref>`, the base only ever moves forward. This needs both sides, so it is a
+     PR-level check, and it is what stops an accidental rebase backwards onto older upstream.
+
 The manifest deliberately records only fields that are stable across the patch series. Recording
 the fork head or the patch SHAs would force a regeneration on every commit, and could never be
 accurate inside the very commit that carries them.
@@ -52,6 +65,7 @@ Usage:
     tools/fork_base.py --check        # verify the manifest AND the pins
     tools/fork_base.py --check --json # machine-readable report
     tools/fork_base.py --print        # emit the computed base, for scripts
+    tools/fork_base.py --check --against origin/farai/main   # PR: base must move forward
 """
 
 from __future__ import annotations
@@ -59,6 +73,7 @@ from __future__ import annotations
 import argparse
 import configparser
 import json
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -87,6 +102,12 @@ def _git_ok(*args: str, cwd: Path | None = None) -> bool:
 def repo_root() -> Path:
     """Return the repository root as a Path."""
     return Path(_git("rev-parse", "--show-toplevel"))
+
+
+def current_branch(root: Path) -> str:
+    """Return the checked-out branch name, or "" when detached."""
+    name = _git("rev-parse", "--abbrev-ref", "HEAD", cwd=root)
+    return "" if name == "HEAD" else name
 
 
 def remote_url(remote: str) -> str:
@@ -305,7 +326,94 @@ def check_pins(root: Path, base_n: str) -> list[dict]:
     return [check_pin(root, s, base_n, upstream_urls, own_pins) for s in subs]
 
 
-def report(base_n: str, manifest_err: str, rows: list[dict], allow_skips: bool) -> None:
+def check_history(root: Path, base_n: str, ref: str, allow_merges: bool) -> list[str]:
+    """Check the SHAPE of history between the base and HEAD.
+
+    The compatibility rule assumes our tree is "upstream@base plus our patches". A merge from
+    upstream breaks that assumption without breaking the rule: merge-base happily reports the
+    newest upstream commit we contain, so the manifest records it, but conflict resolution may
+    have taken `--ours` and silently dropped upstream hunks. Rebasing makes the claim literally
+    true, because the patches are replayed onto upstream's exact tree.
+    """
+    problems = []
+
+    # The base must be a genuine upstream commit, not something invented locally.
+    if not _git_ok("merge-base", "--is-ancestor", base_n, ref, cwd=root):
+        problems.append(f"base {base_n[:12]} is not an ancestor of {ref} — not a real upstream commit")
+
+    # More than one merge-base means a criss-cross history, and `git merge-base` then returns an
+    # arbitrary one — so the recorded base would be non-deterministic.
+    bases = _git("merge-base", "--all", "HEAD", ref, cwd=root).split()
+    if len(bases) > 1:
+        joined = ", ".join(b[:12] for b in bases)
+        problems.append(f"{len(bases)} merge-bases with {ref} ({joined}) — criss-cross history")
+
+    merges = _git("rev-list", "--merges", f"{base_n}..HEAD", cwd=root).split()
+    upstream_merges = []
+    for m in merges:
+        for p in _git("log", "-1", "--format=%P", m, cwd=root).split():
+            # A parent that upstream CONTAINS means upstream came in sideways. Deliberately not
+            # phrased as "in upstream but not in our base": merging upstream moves the base to the
+            # very commit that was merged, so that parent becomes an ancestor of the new base and
+            # the merge would slip through — precisely the case this exists to catch. A purely
+            # internal merge cannot trip this, since both its parents carry our patches and are
+            # therefore not contained in upstream.
+            if _git_ok("merge-base", "--is-ancestor", p, ref, cwd=root):
+                upstream_merges.append(m)
+                break
+
+    if upstream_merges:
+        shown = ", ".join(m[:9] for m in upstream_merges[:3])
+        problems.append(
+            f"{len(upstream_merges)} merge(s) pulled upstream history in sideways ({shown}). "
+            "Replay the patches with `make sync-upstream` instead of merging."
+        )
+    elif merges and not allow_merges:
+        shown = ", ".join(m[:9] for m in merges[:3])
+        problems.append(
+            f"{len(merges)} merge commit(s) in {base_n[:12]}..HEAD ({shown}). These are harmless "
+            "to the compatibility rules but make replaying the series onto a new base expensive, "
+            "since a plain rebase drops each resolution. Pass --allow-merges to permit them."
+        )
+
+    return problems
+
+
+def check_forward(root: Path, base_n: str, against: str) -> list[str]:
+    """Check that the base only moves forward, comparing against another ref's manifest.
+
+    Inherently a PR-level check: it needs both the head's base and the target branch's base, so it
+    is what stops an accidental rebase backwards onto older upstream.
+    """
+    try:
+        old = json.loads(_git("show", f"{against}:{MANIFEST}", cwd=root)).get("upstream_base", "")
+    except (subprocess.CalledProcessError, json.JSONDecodeError):
+        return [f"could not read {MANIFEST} from {against} — skipping the forward-only check"]
+    if not old or old == base_n:
+        return []
+    if not _git_ok("merge-base", "--is-ancestor", old, base_n, cwd=root):
+        return [
+            f"base moved BACKWARDS: {against} records {old[:12]}, which is not an ancestor of "
+            f"{base_n[:12]}. A sync must move the base forward."
+        ]
+    return []
+
+
+def check_sync_branch(branch_name: str, base_n: str) -> list[str]:
+    """For a sync/upstream-<date>-<sha> branch, require the name to match the recorded base.
+
+    This turns the branch name into a checkable claim rather than decoration.
+    """
+    m = re.fullmatch(r"sync/upstream-(\d{8})-([0-9a-f]{7,40})", branch_name or "")
+    if not m:
+        return []
+    sha = m.group(2)
+    if not base_n.startswith(sha):
+        return [f"branch names upstream {sha}, but the manifest records {base_n[:12]}"]
+    return []
+
+
+def report(base_n: str, manifest_err: str, rows: list[dict], allow_skips: bool, history: list[str]) -> None:
     """Print a human-readable report."""
     mark = {OK: "OK  ", MISMATCH: "FAIL", UNCHECKED: "????", SKIPPED: "SKIP"}
     print(f"Base: {base_n[:12]}")
@@ -313,6 +421,9 @@ def report(base_n: str, manifest_err: str, rows: list[dict], allow_skips: bool) 
     if manifest_err:
         for line in manifest_err.splitlines():
             print(f"         {line}")
+    print(f"  [{'FAIL' if history else 'OK  '}] history shape")
+    for line in history:
+        print(f"         {line}")
 
     if rows:
         print("\nPinned dependencies:")
@@ -337,8 +448,8 @@ def report(base_n: str, manifest_err: str, rows: list[dict], allow_skips: bool) 
             f"{len(unchecked)} dependency/ies could not be checked "
             f"({'ignored' if allow_skips else 'treated as failures'})."
         )
-    if not bad and not unchecked and not manifest_err:
-        print("Manifest is current and all pinned dependencies are compatible.")
+    if not bad and not unchecked and not manifest_err and not history:
+        print("Manifest is current, history is well-shaped, and all pins are compatible.")
 
 
 def cmd_check(root: Path, args: argparse.Namespace) -> int:
@@ -362,13 +473,30 @@ def cmd_check(root: Path, args: argparse.Namespace) -> int:
 
     rows = check_pins(root, base_n)
 
+    ref = f"{args.upstream_remote}/{branch}"
+    history = check_history(root, base_n, ref, args.allow_merges)
+    if args.against:
+        history += check_forward(root, base_n, args.against)
+    history += check_sync_branch(args.branch_name or current_branch(root), base_n)
+
     if args.json:
-        print(json.dumps({"base": base_n, "manifest_error": manifest_err, "submodules": rows}, indent=2))
+        print(
+            json.dumps(
+                {
+                    "base": base_n,
+                    "manifest_error": manifest_err,
+                    "history_problems": history,
+                    "submodules": rows,
+                },
+                indent=2,
+            )
+        )
     else:
-        report(base_n, manifest_err, rows, args.allow_skips)
+        report(base_n, manifest_err, rows, args.allow_skips, history)
 
     failing = {MISMATCH} if args.allow_skips else {MISMATCH, UNCHECKED}
-    return 1 if manifest_err or any(r["status"] in failing for r in rows) else 0
+    bad = manifest_err or history or any(r["status"] in failing for r in rows)
+    return 1 if bad else 0
 
 
 def main() -> int:
@@ -383,6 +511,22 @@ def main() -> int:
         "--allow-skips",
         action="store_true",
         help="--check: do not fail on deps that could not be checked (default: they fail)",
+    )
+    parser.add_argument(
+        "--allow-merges",
+        action="store_true",
+        help="--check: permit internal merge commits (upstream merges always fail). For forks "
+        "that are not linear yet.",
+    )
+    parser.add_argument(
+        "--against",
+        default="",
+        help="--check: ref whose manifest the base must have moved forward from (e.g. a PR target)",
+    )
+    parser.add_argument(
+        "--branch-name",
+        default="",
+        help="--check: branch name to validate against the sync/upstream-<date>-<sha> convention",
     )
     parser.add_argument("--upstream-remote", default="upstream", help="remote holding upstream")
     parser.add_argument("--upstream-branch", default="", help="upstream branch (default: main)")

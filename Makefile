@@ -157,7 +157,7 @@ DOCS_PORT ?= 8001
 	lint image-build-remote image-build-local buildx-builder-local \
 	check-promote image-promote-ci image-promote-latest \
 	image-build-list image-build-logs image-build-teardown \
-	fork-base fork-base-check fork-base-print
+	fork-base fork-base-check fork-base-print sync-upstream
 
 help:
 	@echo ""
@@ -192,6 +192,8 @@ help:
 	@echo "  make fork-base            Regenerate .fork-base.json — run after every rebase, then commit it"
 	@echo "  make fork-base-check      Verify the manifest AND the submodule pins (what CI runs)"
 	@echo "  make fork-base-print      Print the computed base commit"
+	@echo "  make sync-upstream        Replay our patches onto newer upstream (creates a sync/ branch)"
+	@echo "                            UPSTREAM_REF=<commit> to target a specific commit; DRY_RUN=1 to preview"
 	@echo ""
 	@echo "Docker image (builds $(DOCKERFILE)):"
 	@echo "  make image-build-remote         Build on the flamingo cluster (ephemeral pod -> shared BuildKit) and push"
@@ -358,6 +360,12 @@ fork-base-check:
 
 fork-base-print:
 	@python3 tools/fork_base.py --print
+
+# Replays the patch series onto a newer upstream commit on a sync/ branch. Stops before pushing:
+# no GitHub merge button produces a linear replay, so the branch is reviewed as a PR and landed
+# with a force-push of the reviewed SHA.
+sync-upstream:
+	@bash tools/sync_upstream.sh
 
 # ==============================
 # Docker image

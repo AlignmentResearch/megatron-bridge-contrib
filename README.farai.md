@@ -269,6 +269,35 @@ A repo with no submodules simply has nothing to do for 2–4. Dependencies that 
 submodule) are **failures**, not skips — otherwise a CI job that forgot `submodules: recursive` would pass while
 checking nothing. `--allow-skips` opts out for local use.
 
+`--check` also enforces the **shape** of history, which those rules assume but cannot see:
+
+5. The patch series is linear. A merge *from upstream* is always refused: it moves the base while conflict resolution
+   may have quietly taken `--ours` and dropped upstream hunks, so the recorded base would overstate how much upstream
+   the tree actually contains. Internal merges are refused too by default — harmless to rules 1–4, but a plain rebase
+   drops each of their resolutions, which is what makes replaying a series onto a new base expensive.
+   `--allow-merges` downgrades that second half for a fork that is not linear yet.
+6. Exactly one merge-base with upstream, so `git merge-base` cannot pick arbitrarily between several.
+7. The base is a genuine upstream commit, not one invented locally.
+8. With `--against <ref>`, the base only ever moves **forward**. This needs both sides, so CI applies it only on PRs;
+   it is what stops an accidental rebase backwards onto older upstream.
+
+### Syncing with upstream
+
+```sh
+make sync-upstream                      # replay onto upstream/main's tip
+make sync-upstream UPSTREAM_REF=<sha>   # ...or onto a specific commit
+make sync-upstream DRY_RUN=1            # preview without touching anything
+```
+
+This creates `sync/upstream-<YYYYMMDD>-<short-sha>`, rebases the patch series onto the target, and regenerates the
+manifest. The branch name is a *checkable claim*: CI asserts the SHA in it equals the recorded `upstream_base`.
+
+It deliberately stops before pushing, because **none of GitHub's merge buttons produce a linear replay** — a merge
+commit is non-linear, squash collapses the series into one commit, and "rebase and merge" would replay the branch onto
+the target's tip and duplicate the patches. So the sync branch is opened as a PR for review and CI, and lands by
+force-pushing the reviewed SHA. The `push:` trigger on `farai/main` then re-runs these checks, so a force-push that
+was not the reviewed commit turns the branch red immediately.
+
 
 ## Development
 
