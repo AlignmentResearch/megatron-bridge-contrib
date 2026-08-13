@@ -1,7 +1,7 @@
 ## GitHub Actions Workflows
 
-This fork's CI is six workflows. Two are inherited from upstream; four are FAR.AI additions.
-See [README.farai.md](../../README.farai.md) for why the other 24 upstream workflows were removed.
+This fork's CI is seven workflows. Two are inherited from upstream; five are FAR.AI additions.
+See [README.farai.md](../../README.farai.md) for why the other 18 upstream workflows were removed.
 
 | Workflow | Trigger | Role |
 |---|---|---|
@@ -9,7 +9,7 @@ See [README.farai.md](../../README.farai.md) for why the other 24 upstream workf
 | `gpu-tests-dispatch.yml` | `@flamingo run …` PR comment | validates the comment and dispatches the requested workflow |
 | `gpu-tests.yml` | dispatched | runs the unit-test suites on the H100 cluster; owns the `gpu-tests/<slug>` commit status |
 | `gpu-tests-gate.yml` | every PR | auto-passes `gpu-tests/default` for PRs that only touch `.testignore`-matched paths |
-| `fork-base.yml` | every PR, push to `farai/main` | fails if `.fork-base.json` no longer matches `merge-base(HEAD, upstream/main)` |
+| `fork-base.yml` | every PR, push to `farai/main` | verifies `.fork-base.json`, the submodule pins, and the shape of history |
 | `detect-secrets.yml` | every PR | upstream secret scanning (uses `config/.secrets.baseline`) |
 | `link-check.yml` | every PR, weekly | upstream external-link checking over `docs/**/*.md` |
 
