@@ -54,7 +54,9 @@ It also enforces the SHAPE of history, which the compatibility rules assume but 
      recorded base is non-deterministic.
   7. The base is a genuine upstream commit (an ancestor of the upstream branch).
   8. With `--against <ref>`, the base only ever moves forward. This needs both sides, so it is a
-     PR-level check, and it is what stops an accidental rebase backwards onto older upstream.
+     PR-level check, and it is what stops an accidental rebase backwards onto older upstream. If
+     the target ref carries no manifest yet — the bootstrap case, where this very PR introduces
+     it — that is reported as a note and does not fail.
 
 The manifest deliberately records only fields that are stable across the patch series. Recording
 the fork head or the patch SHAs would force a regeneration on every commit, and could never be
@@ -379,24 +381,34 @@ def check_history(root: Path, base_n: str, ref: str, allow_merges: bool) -> list
     return problems
 
 
-def check_forward(root: Path, base_n: str, against: str) -> list[str]:
+def check_forward(root: Path, base_n: str, against: str) -> tuple[list[str], list[str]]:
     """Check that the base only moves forward, comparing against another ref's manifest.
 
     Inherently a PR-level check: it needs both the head's base and the target branch's base, so it
     is what stops an accidental rebase backwards onto older upstream.
+
+    Returns (problems, notes). A target branch with NO manifest is a note, not a problem: it is
+    the bootstrap case — the PR that introduces the manifest cannot find one on the branch it
+    targets, and having nothing to compare against is the absence of a comparison rather than a
+    violation. A manifest that exists but cannot be parsed IS a problem, since that is a real
+    fault rather than a missing baseline.
     """
     try:
-        old = json.loads(_git("show", f"{against}:{MANIFEST}", cwd=root)).get("upstream_base", "")
-    except (subprocess.CalledProcessError, json.JSONDecodeError):
-        return [f"could not read {MANIFEST} from {against} — skipping the forward-only check"]
+        raw = _git("show", f"{against}:{MANIFEST}", cwd=root)
+    except subprocess.CalledProcessError:
+        return [], [f"{against} has no {MANIFEST} yet — forward-only check not applicable"]
+    try:
+        old = json.loads(raw).get("upstream_base", "")
+    except json.JSONDecodeError as exc:
+        return [f"{MANIFEST} on {against} is not valid JSON: {exc}"], []
     if not old or old == base_n:
-        return []
+        return [], []
     if not _git_ok("merge-base", "--is-ancestor", old, base_n, cwd=root):
         return [
             f"base moved BACKWARDS: {against} records {old[:12]}, which is not an ancestor of "
             f"{base_n[:12]}. A sync must move the base forward."
-        ]
-    return []
+        ], []
+    return [], []
 
 
 def check_sync_branch(branch_name: str, base_n: str) -> list[str]:
@@ -413,7 +425,14 @@ def check_sync_branch(branch_name: str, base_n: str) -> list[str]:
     return []
 
 
-def report(base_n: str, manifest_err: str, rows: list[dict], allow_skips: bool, history: list[str]) -> None:
+def report(
+    base_n: str,
+    manifest_err: str,
+    rows: list[dict],
+    allow_skips: bool,
+    history: list[str],
+    notes: list[str],
+) -> None:
     """Print a human-readable report."""
     mark = {OK: "OK  ", MISMATCH: "FAIL", UNCHECKED: "????", SKIPPED: "SKIP"}
     print(f"Base: {base_n[:12]}")
@@ -424,6 +443,8 @@ def report(base_n: str, manifest_err: str, rows: list[dict], allow_skips: bool, 
     print(f"  [{'FAIL' if history else 'OK  '}] history shape")
     for line in history:
         print(f"         {line}")
+    for line in notes:
+        print(f"         note: {line}")
 
     if rows:
         print("\nPinned dependencies:")
@@ -475,8 +496,11 @@ def cmd_check(root: Path, args: argparse.Namespace) -> int:
 
     ref = f"{args.upstream_remote}/{branch}"
     history = check_history(root, base_n, ref, args.allow_merges)
+    notes: list[str] = []
     if args.against:
-        history += check_forward(root, base_n, args.against)
+        problems, skipped = check_forward(root, base_n, args.against)
+        history += problems
+        notes += skipped
     history += check_sync_branch(args.branch_name or current_branch(root), base_n)
 
     if args.json:
@@ -486,13 +510,14 @@ def cmd_check(root: Path, args: argparse.Namespace) -> int:
                     "base": base_n,
                     "manifest_error": manifest_err,
                     "history_problems": history,
+                    "history_notes": notes,
                     "submodules": rows,
                 },
                 indent=2,
             )
         )
     else:
-        report(base_n, manifest_err, rows, args.allow_skips, history)
+        report(base_n, manifest_err, rows, args.allow_skips, history, notes)
 
     failing = {MISMATCH} if args.allow_skips else {MISMATCH, UNCHECKED}
     bad = manifest_err or history or any(r["status"] in failing for r in rows)
