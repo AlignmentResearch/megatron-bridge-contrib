@@ -47,6 +47,7 @@ Every deliberate divergence from upstream, newest last. Elaboration follows the 
 | 5 | [Remote test runner](#5-remote-test-runner) | infra | `tools/test_on_flamingo.sh`, `k8s/test-pod.yaml` | this commit |
 | 6 | [Remote image build](#6-remote-image-build) | infra | `tools/build_image_on_flamingo.sh`, `k8s/build-image-pod.yaml` | this commit |
 | 7 | [rsync in the CI image](#7-rsync-in-the-ci-image) | infra | `docker/Dockerfile.ci` | this commit |
+| 8 | [Fork base manifest](#8-fork-base-manifest) | infra | `.fork-base.json`, `tools/fork_base.py`, `.github/workflows/fork-base.yml` | this commit |
 
 ### 1. Pruned NVIDIA-only GitHub workflows
 
@@ -197,6 +198,76 @@ re-sends the entire tree (~258 MB, including `.git`) on every run. The runner pr
 available path automatically, so this is a performance patch, not a correctness one.
 
 If an upstream merge conflicts here, re-applying is a four-line addition at the end of the file.
+
+### 8. Fork base manifest
+
+This repo is consumed as a submodule by the FAR.AI NeMo-RL fork, which pins several third-party dependencies and
+patches some of them. A pin is only sound when the dependencies agree on which upstream they are patching:
+
+> A commit `D` here is **compatible** with a NeMo-RL commit `N` when `D`'s upstream base equals the commit that
+> *upstream* NeMo-RL pins for this dependency at `N`'s own upstream base.
+
+Written out, with `base(X) = merge-base(X, upstream/main)`:
+
+```text
+compatible(N, D)  <=>  base(D) == pin_this_repo( base(N) )
+```
+
+That is a pure function of git data, so it needs no tagging scheme and no external database — a tag names a single
+commit, whereas compatibility is a relation between two repositories, and every rebase would invalidate the tags
+anyway. But there is one obstacle: NeMo-RL declares every submodule `shallow = true`, and a shallow clone has no
+history to compute a merge-base from. So the base is **recorded** here instead of derived there:
+
+```json
+{
+  "schema": 1,
+  "fork_repo": "https://github.com/AlignmentResearch/megatron-bridge-internal",
+  "upstream_repo": "https://github.com/NVIDIA-NeMo/Megatron-Bridge",
+  "upstream_branch": "main",
+  "upstream_base": "95e5f38f8727c4ab30830559c68939f35f4e52f6"
+}
+```
+
+`fork_repo` is part of the key on purpose. Two forks can share an upstream base while carrying completely different
+patch sets, so the base alone does not identify a fork; the consumer compares it against the submodule URL.
+
+The manifest deliberately records **only** fields that are stable across the patch series. It does not record the
+fork head or the patch SHAs: those would force a regeneration on every commit, and could never be accurate inside
+the very commit that carries them. In practice `upstream_base` changes only when you rebase:
+
+```sh
+make fork-base          # regenerate after a rebase, then commit .fork-base.json
+make fork-base-check    # what CI enforces
+make fork-base-print    # just the base commit
+```
+
+Recorded metadata is only worth trusting if something enforces it, and the moment it goes stale is a rebase — exactly
+when nobody is thinking about it. `.github/workflows/fork-base.yml` therefore recomputes the merge-base on every PR
+and push and fails if the manifest disagrees. It needs full history, so it checks out with `fetch-depth: 0` and
+`filter: blob:none` (commit and tree objects suffice; file contents are never read).
+
+The manifest is a normal tracked file, so the CI image's `COPY . /opt/Megatron-Bridge` already bakes it in — a
+running container can report what it is compatible with without a git checkout.
+
+**One tool, both roles.** A repo can be a dependency, a consumer of dependencies, or both, and the two roles are modes
+of the same computation — so `tools/fork_base.py` is written to be dropped **unchanged** into any FAR.AI fork that
+carries patches on an upstream. This repo is both: it is consumed as a submodule, *and* it pins `3rdparty/Megatron-LM`.
+`--check` enforces four things:
+
+1. `.fork-base.json` still equals `merge-base(HEAD, upstream/main)`.
+2. Every pinned submodule is compatible — a patched dependency's recorded base equals the commit upstream pins for it
+   at our base; an unpatched one's gitlink equals upstream's exactly. A dependency with no manifest is treated as
+   unpatched, so the check is useful before every dependency has been converted.
+3. A dependency's manifest names the fork we actually pin (`fork_repo`) and the upstream we actually expect
+   (`upstream_repo`).
+4. A dependency's own nested submodules pin the same commits we do, matched by **URL rather than path** because
+   layouts differ between repos. This one is not redundant: a patch can move a nested gitlink without moving the
+   dependency's base, so rule 2 alone reports green while the two pins have silently diverged. Megatron-LM is exactly
+   this shape — pinned both here and by anything that consumes us.
+
+A repo with no submodules simply has nothing to do for 2–4. Dependencies that cannot be verified (an uninitialized
+submodule) are **failures**, not skips — otherwise a CI job that forgot `submodules: recursive` would pass while
+checking nothing. `--allow-skips` opts out for local use.
 
 
 ## Development

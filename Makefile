@@ -156,7 +156,8 @@ DOCS_PORT ?= 8001
 	test-list test-logs test-teardown \
 	lint image-build-remote image-build-local buildx-builder-local \
 	check-promote image-promote-ci image-promote-latest \
-	image-build-list image-build-logs image-build-teardown
+	image-build-list image-build-logs image-build-teardown \
+	fork-base fork-base-check fork-base-print
 
 help:
 	@echo ""
@@ -186,6 +187,11 @@ help:
 	@echo ""
 	@echo "Lint:"
 	@echo "  make lint                 Run all pre-commit hooks over the tree (same as CI)"
+	@echo ""
+	@echo "Fork base (which upstream commit this fork is rebased onto, and whether our pins agree):"
+	@echo "  make fork-base            Regenerate .fork-base.json — run after every rebase, then commit it"
+	@echo "  make fork-base-check      Verify the manifest AND the submodule pins (what CI runs)"
+	@echo "  make fork-base-print      Print the computed base commit"
 	@echo ""
 	@echo "Docker image (builds $(DOCKERFILE)):"
 	@echo "  make image-build-remote         Build on the flamingo cluster (ephemeral pod -> shared BuildKit) and push"
@@ -328,6 +334,30 @@ lint:
 	@command -v pre-commit >/dev/null 2>&1 || { \
 		echo "pre-commit not found on PATH. Install it: uv tool install pre-commit"; exit 1; }
 	@pre-commit run --all-files --show-diff-on-failure --color=always
+
+# ==============================
+# Fork base
+# ==============================
+# `.fork-base.json` records the upstream commit this fork is rebased onto, so a consumer can tell
+# whether a given commit here is compatible with a given commit there without needing this repo's
+# history. It has to be *recorded* rather than derived because consumers declare their submodules
+# `shallow = true`, and a shallow clone has no merge-base to compute.
+#
+# Only `upstream_base` really varies, and only when you rebase — adding patches on top does not
+# change it, so this is not a per-commit chore.
+#
+# `fork-base-check` also verifies the submodules THIS repo pins (currently 3rdparty/Megatron-LM):
+# the same rule applies one level down, and tools/fork_base.py is written to be dropped unchanged
+# into any fork, whichever role it happens to play.
+
+fork-base:
+	@python3 tools/fork_base.py --write
+
+fork-base-check:
+	@python3 tools/fork_base.py --check
+
+fork-base-print:
+	@python3 tools/fork_base.py --print
 
 # ==============================
 # Docker image

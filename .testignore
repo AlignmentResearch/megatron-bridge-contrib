@@ -19,6 +19,10 @@ CHANGELOG.md
 skills/
 
 # Dev tooling and repo meta
+# .fork-base.json is metadata consumed by NeMo-RL, never by the code under test. It changes on a
+# rebase — but a rebase PR also changes source files, which are not matched here, so the suite
+# still runs.
+.fork-base.json
 .gitignore
 .gitmodules
 .testignore
@@ -35,6 +39,7 @@ codecov.yml
 .github/workflows/pre-commit.yml
 .github/workflows/detect-secrets.yml
 .github/workflows/link-check.yml
+.github/workflows/fork-base.yml
 .github/workflows/README.md
 .github/ISSUE_TEMPLATE/
 .github/PULL_REQUEST_TEMPLATE.md
