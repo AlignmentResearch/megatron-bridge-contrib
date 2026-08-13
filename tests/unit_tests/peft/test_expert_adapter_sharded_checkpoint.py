@@ -209,9 +209,7 @@ def single_rank_process_group():
     if created:
         os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
         os.environ.setdefault("MASTER_PORT", "29511")
-        dist.init_process_group(
-            backend="gloo", world_size=1, rank=0, timeout=datetime.timedelta(minutes=5)
-        )
+        dist.init_process_group(backend="gloo", world_size=1, rank=0, timeout=datetime.timedelta(minutes=5))
     yield
     if created and dist.is_initialized():
         dist.destroy_process_group()
