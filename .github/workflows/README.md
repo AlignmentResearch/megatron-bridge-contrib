@@ -1,7 +1,7 @@
 ## GitHub Actions Workflows
 
-This fork's CI is six workflows. One is inherited from upstream; five are FAR.AI additions.
-See [README.farai.md](../../README.farai.md) for why the other 19 upstream workflows were removed.
+This fork's CI is five workflows, all FAR.AI additions.
+See [README.farai.md](../../README.farai.md) for why all 20 upstream workflows were removed.
 
 | Workflow | Trigger | Role |
 |---|---|---|
@@ -10,7 +10,6 @@ See [README.farai.md](../../README.farai.md) for why the other 19 upstream workf
 | `gpu-tests.yml` | dispatched | runs the unit-test suites on the H100 cluster; owns the `gpu-tests/<slug>` commit status |
 | `gpu-tests-gate.yml` | every PR | auto-passes `gpu-tests/default` for PRs that only touch `.testignore`-matched paths |
 | `fork-base.yml` | every PR, push to `farai/main` | verifies `.fork-base.json`, the submodule pins, and the shape of history |
-| `detect-secrets.yml` | every PR | upstream secret scanning; calls NVIDIA's reusable `_secrets-detector.yml`, with audited findings allowlisted in `config/.secrets.baseline` |
 
 ### pre-commit
 

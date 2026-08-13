@@ -37,7 +37,6 @@ codecov.yml
 # a path under an excluded directory — so a PR editing the test harness would skip the tests it
 # just changed. Add individual files here, never .github/.
 .github/workflows/pre-commit.yml
-.github/workflows/detect-secrets.yml
 .github/workflows/fork-base.yml
 .github/workflows/README.md
 .github/ISSUE_TEMPLATE/
