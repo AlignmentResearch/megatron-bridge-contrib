@@ -192,7 +192,7 @@ help:
 	@echo "  make fork-base            Regenerate .fork-base.json — run after every rebase, then commit it"
 	@echo "  make fork-base-check      Verify the manifest AND the submodule pins (what CI runs)"
 	@echo "  make fork-base-print      Print the computed base commit"
-	@echo "  make sync-upstream        Replay our patches onto newer upstream (creates a sync/ branch)"
+	@echo "  make sync-upstream        Merge newer upstream into this fork (creates a sync/ branch)"
 	@echo "                            UPSTREAM_REF=<commit> to target a specific commit; DRY_RUN=1 to preview"
 	@echo ""
 	@echo "Docker image (builds $(DOCKERFILE)):"
@@ -361,9 +361,9 @@ fork-base-check:
 fork-base-print:
 	@python3 tools/fork_base.py --print
 
-# Replays the patch series onto a newer upstream commit on a sync/ branch. Stops before pushing:
-# no GitHub merge button produces a linear replay, so the branch is reviewed as a PR and landed
-# with a force-push of the reviewed SHA.
+# Merges a newer upstream commit into this fork on a sync/ branch, then stops. The branch is
+# reviewed as a PR and landed with a merge commit, like every PR here — squashing would collapse
+# the merge, so upstream's commits never enter our history and merge-base would not move.
 sync-upstream:
 	@bash tools/sync_upstream.sh
 

@@ -30,24 +30,24 @@ waiting to happen, so prefer configuration and out-of-tree code over in-tree edi
 | `farai/main` | **Default branch.** Upstream `main` plus the FAR.AI patches below. |
 | `main` | Clean mirror of upstream `NVIDIA-NeMo/Megatron-Bridge@main`. Do not commit here. |
 
-New work branches off `farai/main` and merges back via pull request. Upstream changes are periodically merged from
-`main` into `farai/main` — see [Keeping the Fork in Sync](#keeping-the-fork-in-sync-with-upstream).
+New work branches off `farai/main`. Every PR lands with **"Create a merge commit"**, upstream syncs included — see
+[Keeping the Fork in Sync](#keeping-the-fork-in-sync-with-upstream).
 
 
 ## FAR.AI Patches
 
 Every deliberate divergence from upstream, newest last. Elaboration follows the table for rows that need it.
 
-| # | Change | Type | Files | Landed |
-|---|---|---|---|---|
-| 1 | [Pruned NVIDIA-only GitHub workflows](#1-pruned-nvidia-only-github-workflows) | infra | `.github/` | `7768fb52` |
-| 2 | [Lint CI on GitHub-hosted runners](#2-lint-ci-on-github-hosted-runners) | infra | `.github/workflows/pre-commit.yml` | this commit |
-| 3 | [GPU CI on the flamingo cluster](#3-gpu-ci-on-the-flamingo-cluster) | infra | `.github/workflows/gpu-tests*.yml`, `.github/k8s/`, `.testignore` | this commit |
-| 4 | [Makefile](#4-makefile) | infra | `Makefile` | this commit |
-| 5 | [Remote test runner](#5-remote-test-runner) | infra | `tools/test_on_flamingo.sh`, `k8s/test-pod.yaml` | this commit |
-| 6 | [Remote image build](#6-remote-image-build) | infra | `tools/build_image_on_flamingo.sh`, `k8s/build-image-pod.yaml` | this commit |
-| 7 | [rsync in the CI image](#7-rsync-in-the-ci-image) | infra | `docker/Dockerfile.ci` | this commit |
-| 8 | [Fork base manifest](#8-fork-base-manifest) | infra | `.fork-base.json`, `tools/fork_base.py`, `.github/workflows/fork-base.yml` | this commit |
+| # | Change | Type | Files |
+|---|---|---|---|
+| 1 | [Pruned NVIDIA-only GitHub workflows](#1-pruned-nvidia-only-github-workflows) | infra | `.github/` |
+| 2 | [Lint CI on GitHub-hosted runners](#2-lint-ci-on-github-hosted-runners) | infra | `.github/workflows/pre-commit.yml` |
+| 3 | [GPU CI on the flamingo cluster](#3-gpu-ci-on-the-flamingo-cluster) | infra | `.github/workflows/gpu-tests*.yml`, `.github/k8s/`, `.testignore` |
+| 4 | [Makefile](#4-makefile) | infra | `Makefile` |
+| 5 | [Remote test runner](#5-remote-test-runner) | infra | `tools/test_on_flamingo.sh`, `k8s/test-pod.yaml` |
+| 6 | [Remote image build](#6-remote-image-build) | infra | `tools/build_image_on_flamingo.sh`, `k8s/build-image-pod.yaml` |
+| 7 | [rsync in the CI image](#7-rsync-in-the-ci-image) | infra | `docker/Dockerfile.ci` |
+| 8 | [Fork base manifest](#8-fork-base-manifest) | infra | `.fork-base.json`, `tools/fork_base.py`, `tools/sync_upstream.sh`, `.github/workflows/fork-base.yml` |
 
 ### 1. Pruned NVIDIA-only GitHub workflows
 
@@ -81,7 +81,7 @@ being reachable.
 scanning at the GitHub Enterprise level, so this duplicated coverage we already have — and because its scan
 arguments live in the reusable workflow rather than here, the only way to tune it was through
 `.github/workflows/config/.secrets.baseline`. That became a liability once `.fork-base.json` existed: a 40-character
-git SHA is by construction a "Hex High Entropy String", so every rebase would have produced a new false positive and
+git SHA is by construction a "Hex High Entropy String", so every sync would have produced a new false positive and
 required a re-baseline. The baseline was removed with it, since nothing else read it.
 
 `CODEOWNERS` was removed too — every rule targeted NVIDIA teams that do not exist in this org, so it silently
@@ -155,8 +155,8 @@ The pods carry `app.kubernetes.io/component: local-dev` and the script's selecto
 
 ### 6. Remote image build
 
-Both CI and the remote test runner pull `ghcr.io/alignmentresearch/megatron-bridge:latest`, built from upstream's
-`docker/Dockerfile.ci`. That build compiles DeepEP and runs a full `uv sync` — on the order of 90 minutes cold, and
+CI pulls `ghcr.io/alignmentresearch/megatron-bridge:ci` and the remote test runner pulls the branch tag by
+default, both built from upstream's `docker/Dockerfile.ci`. That build compiles DeepEP and runs a full `uv sync` — on the order of 90 minutes cold, and
 too heavy for most laptops. `tools/build_image_on_flamingo.sh` runs it on the cluster's shared BuildKit instead:
 
 ```sh
@@ -234,8 +234,8 @@ compatible(N, D)  <=>  base(D) == pin_this_repo( base(N) )
 ```
 
 That is a pure function of git data, so it needs no tagging scheme and no external database — a tag names a single
-commit, whereas compatibility is a relation between two repositories, and every rebase would invalidate the tags
-anyway. But there is one obstacle: NeMo-RL declares every submodule `shallow = true`, and a shallow clone has no
+commit, whereas compatibility is a relation between two repositories, and any history rewrite would invalidate
+the tags anyway. But there is one obstacle: NeMo-RL declares every submodule `shallow = true`, and a shallow clone has no
 history to compute a merge-base from. So the base is **recorded** here instead of derived there:
 
 ```json
@@ -253,16 +253,16 @@ patch sets, so the base alone does not identify a fork; the consumer compares it
 
 The manifest deliberately records **only** fields that are stable across the patch series. It does not record the
 fork head or the patch SHAs: those would force a regeneration on every commit, and could never be accurate inside
-the very commit that carries them. In practice `upstream_base` changes only when you rebase:
+the very commit that carries them. In practice `upstream_base` moves only when you merge upstream in:
 
 ```sh
-make fork-base          # regenerate after a rebase, then commit .fork-base.json
+make fork-base          # regenerate after a sync merge, then commit .fork-base.json
 make fork-base-check    # what CI enforces
 make fork-base-print    # just the base commit
 ```
 
-Recorded metadata is only worth trusting if something enforces it, and the moment it goes stale is a rebase — exactly
-when nobody is thinking about it. `.github/workflows/fork-base.yml` therefore recomputes the merge-base on every PR
+Recorded metadata is only worth trusting if something enforces it, and the moment it goes stale is a sync merge —
+exactly when attention is on the conflicts instead. `.github/workflows/fork-base.yml` therefore recomputes the merge-base on every PR
 and push and fails if the manifest disagrees. It needs full history, so it checks out with `fetch-depth: 0` and
 `filter: blob:none` (commit and tree objects suffice; file contents are never read).
 
@@ -291,32 +291,45 @@ checking nothing. `--allow-skips` opts out for local use.
 
 `--check` also enforces the **shape** of history, which those rules assume but cannot see:
 
-5. The patch series is linear. A merge *from upstream* is always refused: it moves the base while conflict resolution
-   may have quietly taken `--ours` and dropped upstream hunks, so the recorded base would overstate how much upstream
-   the tree actually contains. Internal merges are refused too by default — harmless to rules 1–4, but a plain rebase
-   drops each of their resolutions, which is what makes replaying a series onto a new base expensive.
-   `--allow-merges` downgrades that second half for a fork that is not linear yet.
-6. Exactly one merge-base with upstream, so `git merge-base` cannot pick arbitrarily between several.
-7. The base is a genuine upstream commit, not one invented locally.
-8. With `--against <ref>`, the base only ever moves **forward**. This needs both sides, so CI applies it only on PRs;
-   it is what stops an accidental rebase backwards onto older upstream.
+5. Our history and upstream's meet at exactly one commit. Several meeting points would make `git merge-base`
+   return an arbitrary one, so `upstream_base` would stop being reproducible.
+6. With `--against <ref>`, the base only ever moves **forward** relative to the PR's target branch. Merging cannot
+   move it backwards, so this mainly catches a hand-edited manifest; it needs both sides, so CI applies it only on PRs.
 
 ### Syncing with upstream
 
 ```sh
-make sync-upstream                      # replay onto upstream/main's tip
-make sync-upstream UPSTREAM_REF=<sha>   # ...or onto a specific commit
+make sync-upstream                      # merge upstream/main's tip
+make sync-upstream UPSTREAM_REF=<sha>   # ...or a specific commit
 make sync-upstream DRY_RUN=1            # preview without touching anything
 ```
 
-This creates `sync/upstream-<YYYYMMDD>-<short-sha>`, rebases the patch series onto the target, and regenerates the
-manifest. The branch name is a *checkable claim*: CI asserts the SHA in it equals the recorded `upstream_base`.
+This creates `sync/upstream-<YYYYMMDD>-<short-sha>`, merges the target into it, and regenerates the manifest. The
+branch name is a *checkable claim*: CI asserts the SHA in it equals the recorded `upstream_base`.
 
-It deliberately stops before pushing, because **none of GitHub's merge buttons produce a linear replay** — a merge
-commit is non-linear, squash collapses the series into one commit, and "rebase and merge" would replay the branch onto
-the target's tip and duplicate the patches. So the sync branch is opened as a PR for review and CI, and lands by
-force-pushing the reviewed SHA. The `push:` trigger on `farai/main` then re-runs these checks, so a force-push that
-was not the reviewed commit turns the branch red immediately.
+Merging rather than rebasing because force-pushing `farai/main` is banned: a merge advances the base without
+rewriting anything, so nothing anyone has cloned is invalidated.
+
+```mermaid
+gitGraph
+   commit id: "u1"
+   commit id: "u2"
+   branch farai/main
+   commit id: "p1"
+   commit id: "p2"
+   checkout main
+   commit id: "u3"
+   commit id: "u4"
+   checkout farai/main
+   merge main id: "sync"
+   commit id: "record base u4"
+```
+
+`upstream_base` is the newest upstream commit our history contains — `u2` before the sync, `u4` after it. The merge
+adds `u3` and `u4` to our ancestry without touching `p1` or `p2`, which keep their SHAs.
+
+**Land it with "Create a merge commit".** Squashing collapses the merge, so upstream's commits never enter our
+history and `merge-base` does not move — the manifest would then disagree with git.
 
 
 ## Development
@@ -347,7 +360,7 @@ make test-unit-diffusion   # diffusion only
 
 ### Docs
 
-Upstream's Sphinx site builds cleanly. `docs/fern/` is a parallel, NVIDIA-hosted docs pipeline we do not use.
+Upstream's Sphinx site builds cleanly.
 
 ```sh
 make docs-html   # build to docs/_build/html
@@ -372,20 +385,28 @@ Add the NVIDIA repo as a remote named `upstream` once:
 git remote add upstream https://github.com/NVIDIA-NeMo/Megatron-Bridge.git
 ```
 
-Then to pull in new upstream commits:
+Refresh the clean mirror:
 
 ```sh
 git fetch upstream
 git checkout main
 git merge --ff-only upstream/main     # keep `main` a clean mirror
 git push origin main
-
-git checkout farai/main
-git merge main
 ```
 
-Resolve any conflicts, run the tests, then push `farai/main`. Feature branches should be rebased or merged against the
-updated `farai/main` after each sync.
+Then sync `farai/main` through a PR rather than pushing to it directly:
+
+```sh
+git checkout farai/main
+make sync-upstream                    # creates sync/upstream-<date>-<sha>, merges, updates the manifest
+git push -u origin sync/upstream-<date>-<sha>
+```
+
+Open that branch as a PR against `farai/main`, let CI run, and land it with **"Create a merge commit"**.
+
+When resolving conflicts, don't take `--ours` wholesale: that silently drops upstream's changes to a file while the
+recorded base still claims we contain them. Rebasing your own feature branches onto the updated `farai/main` is fine
+— the force-push ban applies to `farai/main`, not to unshared branches.
 
 Conflicts concentrate in `.github/` — upstream actively develops the workflows we deleted. When a merge reintroduces
 one, delete it again rather than reconciling it; the [FAR.AI Patches](#farai-patches) table above is the record of

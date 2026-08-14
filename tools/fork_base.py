@@ -45,18 +45,15 @@ Repos with no submodules simply have nothing to do for 2-4.
 
 It also enforces the SHAPE of history, which the compatibility rules assume but cannot see:
 
-  5. The patch series is linear. No merge may pull upstream history in sideways — such a merge
-     moves the base without the tree necessarily following, because conflict resolution may have
-     dropped upstream hunks — and by default internal merges are refused too, since a plain rebase
-     drops their resolutions and makes replaying onto a new base expensive. `--allow-merges`
-     downgrades the second half for a fork that is not linear yet; an upstream merge always fails.
-  6. Exactly one merge-base with upstream — otherwise `git merge-base` picks arbitrarily and the
-     recorded base is non-deterministic.
-  7. The base is a genuine upstream commit (an ancestor of the upstream branch).
-  8. With `--against <ref>`, the base only ever moves forward. This needs both sides, so it is a
-     PR-level check, and it is what stops an accidental rebase backwards onto older upstream. If
-     the target ref carries no manifest yet — the bootstrap case, where this very PR introduces
-     it — that is reported as a note and does not fail.
+  5. Our history and upstream's meet at exactly one commit. Several meeting points would make
+     `git merge-base` return an arbitrary one, so `upstream_base` would stop being reproducible.
+  6. With `--against <ref>`, the base only ever moves forward. This needs both sides, so it is a
+     PR-level check. If the target ref carries no manifest yet — the bootstrap case, where this
+     very PR introduces it — that is reported as a note and does not fail.
+
+Merges from upstream are how the base advances: force-pushing is banned, so `git merge
+upstream/<branch>` is the sync mechanism. It rewrites nothing — upstream's commits keep their SHAs
+and simply become reachable, so merge-base moves forward on its own.
 
 The manifest deliberately records only fields that are stable across the patch series. Recording
 the fork head or the patch SHAs would force a regeneration on every commit, and could never be
@@ -328,55 +325,24 @@ def check_pins(root: Path, base_n: str) -> list[dict]:
     return [check_pin(root, s, base_n, upstream_urls, own_pins) for s in subs]
 
 
-def check_history(root: Path, base_n: str, ref: str, allow_merges: bool) -> list[str]:
-    """Check the SHAPE of history between the base and HEAD.
+def check_history(root: Path, base_n: str, ref: str) -> list[str]:
+    """Check that the base is unambiguous.
 
-    The compatibility rule assumes our tree is "upstream@base plus our patches". A merge from
-    upstream breaks that assumption without breaking the rule: merge-base happily reports the
-    newest upstream commit we contain, so the manifest records it, but conflict resolution may
-    have taken `--ours` and silently dropped upstream hunks. Rebasing makes the claim literally
-    true, because the patches are replayed onto upstream's exact tree.
+    `base_n` needs no validation as an upstream commit: it comes from `git merge-base`, which
+    returns an ancestor of the upstream ref by definition. What can go wrong is there being more
+    than one such ancestor.
     """
     problems = []
 
-    # The base must be a genuine upstream commit, not something invented locally.
-    if not _git_ok("merge-base", "--is-ancestor", base_n, ref, cwd=root):
-        problems.append(f"base {base_n[:12]} is not an ancestor of {ref} — not a real upstream commit")
-
-    # More than one merge-base means a criss-cross history, and `git merge-base` then returns an
-    # arbitrary one — so the recorded base would be non-deterministic.
+    # Several merge-bases means `git merge-base` picks one arbitrarily, so the recorded base would
+    # stop being reproducible. This needs history to have crossed in BOTH directions — it cannot
+    # arise from merging upstream in, nor from cherry-picking a patch upstream (that creates a new
+    # commit with no ancestry link back to ours). It would take upstream merging a branch that
+    # carries our history, so upstream a patch by cherry-picking onto upstream/main instead.
     bases = _git("merge-base", "--all", "HEAD", ref, cwd=root).split()
     if len(bases) > 1:
         joined = ", ".join(b[:12] for b in bases)
         problems.append(f"{len(bases)} merge-bases with {ref} ({joined}) — criss-cross history")
-
-    merges = _git("rev-list", "--merges", f"{base_n}..HEAD", cwd=root).split()
-    upstream_merges = []
-    for m in merges:
-        for p in _git("log", "-1", "--format=%P", m, cwd=root).split():
-            # A parent that upstream CONTAINS means upstream came in sideways. Deliberately not
-            # phrased as "in upstream but not in our base": merging upstream moves the base to the
-            # very commit that was merged, so that parent becomes an ancestor of the new base and
-            # the merge would slip through — precisely the case this exists to catch. A purely
-            # internal merge cannot trip this, since both its parents carry our patches and are
-            # therefore not contained in upstream.
-            if _git_ok("merge-base", "--is-ancestor", p, ref, cwd=root):
-                upstream_merges.append(m)
-                break
-
-    if upstream_merges:
-        shown = ", ".join(m[:9] for m in upstream_merges[:3])
-        problems.append(
-            f"{len(upstream_merges)} merge(s) pulled upstream history in sideways ({shown}). "
-            "Replay the patches with `make sync-upstream` instead of merging."
-        )
-    elif merges and not allow_merges:
-        shown = ", ".join(m[:9] for m in merges[:3])
-        problems.append(
-            f"{len(merges)} merge commit(s) in {base_n[:12]}..HEAD ({shown}). These are harmless "
-            "to the compatibility rules but make replaying the series onto a new base expensive, "
-            "since a plain rebase drops each resolution. Pass --allow-merges to permit them."
-        )
 
     return problems
 
@@ -495,7 +461,7 @@ def cmd_check(root: Path, args: argparse.Namespace) -> int:
     rows = check_pins(root, base_n)
 
     ref = f"{args.upstream_remote}/{branch}"
-    history = check_history(root, base_n, ref, args.allow_merges)
+    history = check_history(root, base_n, ref)
     notes: list[str] = []
     if args.against:
         problems, skipped = check_forward(root, base_n, args.against)
@@ -536,12 +502,6 @@ def main() -> int:
         "--allow-skips",
         action="store_true",
         help="--check: do not fail on deps that could not be checked (default: they fail)",
-    )
-    parser.add_argument(
-        "--allow-merges",
-        action="store_true",
-        help="--check: permit internal merge commits (upstream merges always fail). For forks "
-        "that are not linear yet.",
     )
     parser.add_argument(
         "--against",

@@ -1,18 +1,16 @@
 #!/usr/bin/env bash
-# Replay this fork's patches onto a newer upstream commit.
+# Bring newer upstream commits into this fork by MERGING them.
 #
-# Invoked by `make sync-upstream`. Creates sync/upstream-<YYYYMMDD>-<short-sha>, rebases the patch
-# series onto the target, and regenerates .fork-base.json.
+# Invoked by `make sync-upstream`. Creates sync/upstream-<YYYYMMDD>-<short-sha>, merges the target
+# upstream commit into it, and regenerates .fork-base.json.
 #
-# Why a rebase and not a merge: the compatibility rule assumes our tree is "upstream@base plus our
-# patches". A merge moves the base while conflict resolution may quietly drop upstream hunks, so
-# the recorded base would overstate how much upstream we actually have. Replaying makes the claim
-# literally true.
+# Why a merge and not a rebase: force-pushing the shared branch is banned, so a rebase of
+# farai/main cannot land. A merge advances the base without rewriting anything — upstream's
+# commits keep their SHAs and simply become reachable from our HEAD, so merge-base moves forward
+# to the newest upstream commit we contain, which is what the manifest records.
 #
-# This deliberately stops before pushing. None of GitHub's merge buttons produce a linear replay
-# (a merge commit is non-linear, squash collapses the series, and "rebase and merge" would
-# duplicate the patches onto the branch tip), so the sync branch is opened as a PR for review and
-# CI, and lands by force-pushing the reviewed SHA.
+# This stops before pushing. The branch is opened as a PR for review and CI, and MUST be landed
+# with a merge commit — see the note this prints at the end.
 set -euo pipefail
 
 REMOTE=${UPSTREAM_REMOTE:-upstream}
@@ -41,19 +39,12 @@ OLD_BASE=$(git merge-base HEAD "$REMOTE/$BRANCH")
 git merge-base --is-ancestor "$TARGET" "$REMOTE/$BRANCH" || \
   die "$(git rev-parse --short=9 "$TARGET") is not an ancestor of $REMOTE/$BRANCH"
 
-if [ "$TARGET" = "$OLD_BASE" ]; then
-  echo "Already based on $(git rev-parse --short=9 "$TARGET") — nothing to sync."
+if git merge-base --is-ancestor "$TARGET" HEAD; then
+  echo "Already contains $(git rev-parse --short=9 "$TARGET") — nothing to sync."
   exit 0
 fi
 
-# Forward-only. Rebasing onto older upstream would silently revert upstream fixes.
-git merge-base --is-ancestor "$OLD_BASE" "$TARGET" || \
-  die "target $(git rev-parse --short=9 "$TARGET") is not a descendant of the current base
-       $(git rev-parse --short=9 "$OLD_BASE"). A sync must move the base forward."
-
 SYNC_BRANCH="sync/upstream-$(date +%Y%m%d)-$(git rev-parse --short=9 "$TARGET")"
-PATCHES=$(git rev-list --count "$OLD_BASE..HEAD")
-MERGES=$(git rev-list --merges --count "$OLD_BASE..HEAD")
 
 cat <<INFO
 
@@ -61,31 +52,28 @@ cat <<INFO
   current base  : $(git rev-parse --short=9 "$OLD_BASE")  ($(git log -1 --format=%as "$OLD_BASE"))
   target base   : $(git rev-parse --short=9 "$TARGET")  ($(git log -1 --format=%as "$TARGET"))
   upstream delta: $(git rev-list --count "$OLD_BASE..$TARGET") commits
-  patches       : $PATCHES ($MERGES merge commits)
+  our commits   : $(git rev-list --count --no-merges "$OLD_BASE..HEAD")
   sync branch   : $SYNC_BRANCH
 
 INFO
 
-if [ "$MERGES" -gt 0 ]; then
-  echo "NOTE: $MERGES merge commit(s) in the series. A plain rebase flattens them; each dropped"
-  echo "      conflict resolution has to be redone. Consider linearizing first."
-  echo
-fi
-
 if [ "$DRY_RUN" = "1" ]; then echo "DRY_RUN=1 — stopping before any change."; exit 0; fi
 
 git checkout -q -b "$SYNC_BRANCH"
-echo "Replaying $PATCHES commits onto $(git rev-parse --short=9 "$TARGET") ..."
-if ! git rebase --onto "$TARGET" "$OLD_BASE"; then
+echo "Merging $(git rev-parse --short=9 "$TARGET") into $SYNC_BRANCH ..."
+if ! git merge --no-ff "$TARGET" -m "Merge upstream $(git rev-parse --short=9 "$TARGET") into $START_BRANCH"; then
   cat <<'RECOVER'
 
-Rebase stopped on a conflict. Resolve it, then:
+Merge stopped on a conflict. Resolve it, then:
 
-    git add <files> && git rebase --continue     # repeat until done
-    make fork-base                               # regenerate the manifest
+    git add <files> && git commit          # completes the merge
+    make fork-base                         # regenerate the manifest
     git add .fork-base.json && git commit -m "chore: record new upstream base"
 
-To abandon:  git rebase --abort && git checkout - && git branch -D <sync branch>
+Resolve deliberately: taking --ours wholesale keeps our version of a file and silently discards
+upstream's changes to it, while the recorded base still claims we contain that upstream commit.
+
+To abandon:  git merge --abort && git checkout - && git branch -D <sync branch>
 RECOVER
   exit 1
 fi
@@ -93,7 +81,7 @@ fi
 python3 tools/fork_base.py --write
 if [ -n "$(git status --porcelain -- .fork-base.json)" ]; then
   git add .fork-base.json
-  git commit -q -m "chore(fork-base): rebase onto upstream $(git rev-parse --short=9 "$TARGET")"
+  git commit -q -m "chore(fork-base): record upstream base $(git rev-parse --short=9 "$TARGET")"
 fi
 
 echo
@@ -104,7 +92,9 @@ cat <<NEXT
 Done. Review, then:
 
     git push -u origin $SYNC_BRANCH
-    # open a PR against $START_BRANCH for review + CI, then land it with:
-    git push --force-with-lease origin $SYNC_BRANCH:$START_BRANCH
+    # open a PR against $START_BRANCH
+
+Land it with "Create a merge commit". Squashing collapses the merge, so upstream's commits never
+enter our history and merge-base does not move.
 
 NEXT
