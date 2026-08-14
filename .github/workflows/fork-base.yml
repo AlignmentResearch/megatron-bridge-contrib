@@ -1,0 +1,77 @@
+# Verifies that `.fork-base.json` still matches what git says, and that this repo's own pinned
+# submodules are compatible with it.
+#
+# The manifest records the upstream commit this fork is rebased onto so that a consumer — which
+# pins this repo as a `shallow = true` submodule and therefore cannot compute a merge-base — can
+# decide whether a commit here is compatible with a commit there. Recorded metadata is only
+# trustworthy if something enforces it, and the moment it goes stale is a rebase, which is exactly
+# when nobody is thinking about it. Hence this check.
+#
+# The same workflow and the same tools/fork_base.py are meant to be dropped unchanged into every
+# fork that carries patches on an upstream; a repo with no submodules simply has fewer things to
+# verify.
+name: fork-base
+
+# NO `paths:` filter on pull_request, deliberately. This is meant to be a REQUIRED status check,
+# and a required context that is skipped for some PRs never reports at all — those PRs stay
+# blocked forever. The job is a shallow clone plus a merge-base, so running it on every PR is
+# cheap. `push` covers direct pushes to farai/main, which no PR check ever sees.
+on:
+  pull_request:
+  push:
+    branches: [farai/main]
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    # Explicit job name: this string IS the status context to mark required in the ruleset.
+    # Without it the context would be the bare job id ("check"), which is meaningless in a list of
+    # required checks alongside gpu-tests/default and pre-commit.
+    name: fork-base
+    runs-on: ubuntu-latest
+    steps:
+      # fetch-depth: 0 — merge-base needs real history, and the default depth-1 clone has none.
+      # filter: blob:none keeps that affordable: commit and tree objects are enough to compute a
+      # merge-base, and file contents are never read.
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          filter: blob:none
+          # Required: the pin check reads each dependency's own .fork-base.json and .gitmodules
+          # from the working tree. Without this every dependency reports "unchecked", which is a
+          # failure in strict mode precisely so a forgotten checkout cannot pass vacuously.
+          # Shallow submodules are fine — only gitlinks and two small files are read.
+          submodules: recursive
+          # Check the PR head itself, not the synthetic merge commit, so the manifest is validated
+          # exactly as it will land.
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+
+      - name: Fetch upstream
+        run: |
+          set -euo pipefail
+          # Read the upstream coordinates FROM the manifest, so a fork that repoints upstream needs
+          # no workflow edit. jq is preinstalled on ubuntu-latest.
+          url=$(jq -er .upstream_repo .fork-base.json)
+          branch=$(jq -er .upstream_branch .fork-base.json)
+          echo "upstream: $url ($branch)"
+          git remote add upstream "$url"
+          git fetch --filter=blob:none --no-tags upstream "$branch:refs/remotes/upstream/$branch"
+
+      - name: Check manifest, pinned dependencies, and history shape
+        env:
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
+          HEAD_REF: ${{ github.head_ref }}
+        run: |
+          set -euo pipefail
+          args=()
+          # On a PR, also require that the base moved FORWARD relative to the target branch, and
+          # that a sync/upstream-<date>-<sha> branch name matches the base it claims. Both need
+          # the target branch's manifest, so they only apply here — a push has nothing to compare
+          # against.
+          if [ -n "${BASE_REF:-}" ]; then
+            git fetch --filter=blob:none --no-tags origin "$BASE_REF:refs/remotes/origin/$BASE_REF"
+            args+=(--against "origin/$BASE_REF" --branch-name "$HEAD_REF")
+          fi
+          python3 tools/fork_base.py --check ${args[@]+"${args[@]}"}

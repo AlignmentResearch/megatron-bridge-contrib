@@ -1,0 +1,7 @@
+{
+  "schema": 1,
+  "fork_repo": "https://github.com/AlignmentResearch/megatron-bridge-internal",
+  "upstream_repo": "https://github.com/NVIDIA-NeMo/Megatron-Bridge",
+  "upstream_branch": "main",
+  "upstream_base": "95e5f38f8727c4ab30830559c68939f35f4e52f6"
+}

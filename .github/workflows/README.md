@@ -1,7 +1,7 @@
 ## GitHub Actions Workflows
 
-This fork's CI is five workflows. Two are inherited from upstream; three are FAR.AI additions.
-See [README.farai.md](../../README.farai.md) for why the other 24 upstream workflows were removed.
+This fork's CI is five workflows, all FAR.AI additions.
+See [README.farai.md](../../README.farai.md) for why all 20 upstream workflows were removed.
 
 | Workflow | Trigger | Role |
 |---|---|---|
@@ -9,8 +9,7 @@ See [README.farai.md](../../README.farai.md) for why the other 24 upstream workf
 | `gpu-tests-dispatch.yml` | `@flamingo run …` PR comment | validates the comment and dispatches the requested workflow |
 | `gpu-tests.yml` | dispatched | runs the unit-test suites on the H100 cluster; owns the `gpu-tests/<slug>` commit status |
 | `gpu-tests-gate.yml` | every PR | auto-passes `gpu-tests/default` for PRs that only touch `.testignore`-matched paths |
-| `detect-secrets.yml` | every PR | upstream secret scanning (uses `config/.secrets.baseline`) |
-| `link-check.yml` | every PR, weekly | upstream external-link checking over `docs/**/*.md` |
+| `fork-base.yml` | every PR, push to `farai/main` | verifies `.fork-base.json`, the submodule pins, and the shape of history |
 
 ### pre-commit
 
@@ -24,6 +23,31 @@ make lint          # or: pre-commit run --all-files
 Note this invokes `pre-commit` directly rather than `uv run --group dev pre-commit`. The dev
 group pulls `nvidia-resiliency-ext`, which publishes Linux-only wheels and cannot install on
 macOS/arm64; no hook needs that environment.
+
+### fork-base
+
+Recomputes `merge-base(HEAD, upstream/main)` and fails if it disagrees with the `upstream_base`
+recorded in `.fork-base.json`, then checks the submodules this repo pins against the same rule.
+That manifest is how a consumer decides whether a commit here is compatible with a commit there —
+see [README.farai.md](../../README.farai.md#8-fork-base-manifest). The check exists because the
+manifest is recorded rather than derived (consumers pin this repo as a `shallow = true`
+submodule), and recorded data drifts. Run it locally with `make fork-base-check`; fix a manifest
+failure with `make fork-base` and commit the result.
+
+The checkout uses `submodules: recursive` because the pin check reads each dependency's own
+`.fork-base.json` and `.gitmodules` from the working tree. A dependency that cannot be verified is
+a **failure**, not a skip — otherwise forgetting that setting would turn the whole job into a
+vacuous pass.
+
+The upstream repo and branch are read out of the manifest itself, so repointing upstream needs no
+workflow edit. No secrets are required — upstream is public.
+
+**Make it a required check.** The workflow reports the status context `fork-base`; add it to the
+ruleset alongside `gpu-tests/default` so a PR that moves the base cannot merge with a stale
+manifest. It runs on every PR with no `paths:` filter on purpose — a required context that is
+skipped for some PRs never reports, and those PRs stay blocked forever (the same trap called out
+for the gate's `REQUIRED_CONTEXTS` above). The job is a blobless shallow clone plus one
+`merge-base`, so running it everywhere costs almost nothing.
 
 ### GPU tests: triggering a run
 

@@ -19,6 +19,10 @@ CHANGELOG.md
 skills/
 
 # Dev tooling and repo meta
+# .fork-base.json is metadata consumed by NeMo-RL, never by the code under test. It changes on a
+# rebase — but a rebase PR also changes source files, which are not matched here, so the suite
+# still runs.
+.fork-base.json
 .gitignore
 .gitmodules
 .testignore
@@ -33,11 +37,28 @@ codecov.yml
 # a path under an excluded directory — so a PR editing the test harness would skip the tests it
 # just changed. Add individual files here, never .github/.
 .github/workflows/pre-commit.yml
-.github/workflows/detect-secrets.yml
-.github/workflows/link-check.yml
+.github/workflows/fork-base.yml
 .github/workflows/README.md
 .github/ISSUE_TEMPLATE/
 .github/PULL_REQUEST_TEMPLATE.md
+
+# Local developer tooling. CI never invokes any of it: gpu-tests.yml drives the suites through
+# kubectl against .github/k8s/pytest-multigpu-job.yaml and references no make target, no tools/
+# script, and nothing under the top-level k8s/ (which holds the component: local-dev pod specs
+# used by `make test-unit-remote` and `make image-build-remote`). The image CI runs is pulled by
+# the :ci tag, which moves only on an explicit promotion — so even the image-build tooling cannot
+# change a CI result by being edited.
+#
+# Listed FILE BY FILE for the same reason as the workflows above: `tools/` as a directory would
+# silently exempt any future tool that DOES affect the suites, and gitignore cannot re-include a
+# path underneath an excluded directory.
+Makefile
+tools/fork_base.py
+tools/sync_upstream.sh
+tools/build_image_on_flamingo.sh
+tools/test_on_flamingo.sh
+k8s/test-pod.yaml
+k8s/build-image-pod.yaml
 
 # Tests that FAR.AI CI does not run. The functional suites depend on NVIDIA's pre-populated
 # /home/TestData volume, and the gb200 launch scripts target ARM64 hardware we do not have;
