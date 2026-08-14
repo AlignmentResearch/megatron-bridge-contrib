@@ -27,14 +27,15 @@ from megatron.core.optimizer import OptimizerConfig
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer import MegatronModule, TransformerConfig
 from megatron.core.utils import get_model_config
+from megatron.training.models.base import ModelConfig
 
-from megatron.bridge.models.common import ModelConfig
 from megatron.bridge.models.model_provider import ModelParallelKwargs, ModelProviderMixin
 from megatron.bridge.training.checkpointing import save_checkpoint
 from megatron.bridge.training.config import CheckpointConfig, ConfigContainer, LoggerConfig
 from megatron.bridge.training.state import GlobalState
 from megatron.bridge.training.tokenizers.tokenizer import MegatronTokenizer, build_tokenizer
 from megatron.bridge.training.utils.checkpoint_utils import file_exists
+from megatron.bridge.utils.cuda_graph import clear_cuda_graph_modules
 from megatron.bridge.utils.vocab_utils import calculate_padded_vocab_size
 
 
@@ -46,6 +47,30 @@ HF_BASED_TOKENIZERS = [
     "GPT2BPETokenizer",
     "HuggingFaceTokenizer",
 ]
+
+
+def _uses_hybrid_rng_tracker(model_cfg: Any) -> bool:
+    is_hybrid_model = getattr(model_cfg, "is_hybrid_model", False)
+    if isinstance(is_hybrid_model, bool) and is_hybrid_model:
+        return True
+
+    hybrid_layer_pattern = getattr(model_cfg, "hybrid_layer_pattern", None)
+    return isinstance(hybrid_layer_pattern, str) and bool(hybrid_layer_pattern)
+
+
+def _disable_cuda_graphs_for_hybrid_load(model_cfg: Any) -> None:
+    if not _uses_hybrid_rng_tracker(model_cfg):
+        return
+
+    for name, value in (
+        ("cuda_graph_impl", "none"),
+        ("enable_cuda_graph", False),
+        ("external_cuda_graph", False),
+    ):
+        if hasattr(model_cfg, name):
+            setattr(model_cfg, name, value)
+    if hasattr(model_cfg, "cuda_graph_scope") or hasattr(model_cfg, "cuda_graph_modules"):
+        clear_cuda_graph_modules(model_cfg)
 
 
 def torch_dtype_from_mcore_config(config: Any) -> torch.dtype:
@@ -173,6 +198,11 @@ def load_tokenizer(checkpoint_path: str, **kwargs) -> MegatronTokenizer:
     else:
         cfg = _tokenizer_config_from_args(mlm_args)
 
+    hf_tokenizer_kwargs = kwargs.get("hf_tokenizer_kwargs")
+    caller_trusts_remote_code = kwargs.get("trust_remote_code") is True or (
+        isinstance(hf_tokenizer_kwargs, dict) and hf_tokenizer_kwargs.get("trust_remote_code") is True
+    )
+
     for key, val in kwargs.items():
         if hasattr(cfg, key):
             setattr(cfg, key, val)
@@ -181,10 +211,36 @@ def load_tokenizer(checkpoint_path: str, **kwargs) -> MegatronTokenizer:
                 f"Attempting to set a non-existent attribute '{key}' on TokenizerConfig.\nState of TokenizerConfig before attempting this override: {cfg}"
             )
 
+    if getattr(cfg, "trust_remote_code", False) is True and not caller_trusts_remote_code:
+        raise ValueError(
+            "Checkpoint tokenizer config requested trust_remote_code=True. "
+            "Pass trust_remote_code=True to load_tokenizer() only if you trust the checkpoint tokenizer code."
+        )
+
     if cfg.tokenizer_type in HF_BASED_TOKENIZERS and cfg.tokenizer_model == Path():
         cfg.tokenizer_model = Path(checkpoint_path) / "tokenizer"
 
     return build_tokenizer(cfg)
+
+
+def _normalize_moe_dispatcher_sm_config(model_dict: dict[str, Any]) -> None:
+    """Migrate legacy per-backend MoE SM counts when MCore supports the unified field."""
+    unified_key = "moe_flex_dispatcher_num_sms"
+    if not hasattr(TransformerConfig, unified_key):
+        return
+
+    # TODO: remove this guard when MCore dev includes commit 2d7060f44fc9 and Bridge no longer
+    # supports checkpoints saved with the legacy per-backend SM-count fields.
+    if model_dict.get(unified_key) is None:
+        backend = model_dict.get("moe_flex_dispatcher_backend", "deepep")
+        legacy_key = "moe_hybridep_num_sms" if backend == "hybridep" else "moe_deepep_num_sms"
+        legacy_value = model_dict.get(legacy_key)
+        if legacy_value is not None:
+            model_dict[unified_key] = legacy_value
+
+    for legacy_key in ("moe_deepep_num_sms", "moe_hybridep_num_sms"):
+        if legacy_key in model_dict:
+            model_dict[legacy_key] = None
 
 
 def load_model_config(
@@ -225,6 +281,7 @@ def load_model_config(
             model_dict["hybrid_layer_pattern"] = model_dict.pop("hybrid_override_pattern")
         if isinstance(model_dict.get("pipeline_model_parallel_layout"), dict):
             model_dict["pipeline_model_parallel_layout"] = None
+        _normalize_moe_dispatcher_sm_config(model_dict)
     else:
         try:
             mlm_args = _load_args_from_checkpoint(checkpoint_path)
@@ -246,7 +303,7 @@ def load_model_config(
 def build_and_load_model(
     checkpoint_path: str,
     model_cfg: TransformerConfig | ModelConfig,
-    model_type: Optional[Literal["gpt", "mamba"]] = None,
+    model_type: Optional[Literal["gpt", "hybrid", "mamba"]] = None,
     megatron_args: Optional[argparse.Namespace] = None,
     return_state_dict: bool = False,
     use_cpu_init: bool = False,
@@ -264,7 +321,7 @@ def build_and_load_model(
         model_cfg: Model config from load_model_config(). Either a TransformerConfig or
             a model provider (e.g. GPTModelProvider) depending on source of checkpoint.
         model_type: If the checkpoint is from MegatronLM, the model type is required. Currently,
-            only GPT and Mamba models are supported.
+            GPT and Hybrid models are supported; "mamba" is accepted as a deprecated alias.
         megatron_args: If the checkpoint is from MegatronLM, this is required.
         return_state_dict: If True, return the state dict instead of model instance. Default: False.
         use_cpu_init: If True, use CPU initialization context for the model and Gloo backend.
@@ -281,7 +338,7 @@ def build_and_load_model(
         _load_model_weights_from_checkpoint,
     )
     from megatron.bridge.training.mlm_compat.arguments import _tokenizer_config_from_args
-    from megatron.bridge.training.mlm_compat.model import _get_model, _gpt_provider, _mamba_provider
+    from megatron.bridge.training.mlm_compat.model import _get_model, _gpt_provider, _hybrid_provider
     from megatron.bridge.training.post_training.checkpointing import has_modelopt_state
 
     if has_modelopt_state(checkpoint_path):
@@ -310,7 +367,7 @@ def build_and_load_model(
                 ProcessGroupCollection.use_mpu_process_groups(), wrap_with_ddp=False
             )
         else:
-            assert model_type in ("gpt", "mamba"), f"model type {model_type} not supported."
+            assert model_type in ("gpt", "hybrid", "mamba"), f"model type {model_type} not supported."
             assert megatron_args is not None, "megatron_args must be provided if the checkpoint is from MegatronLM."
 
             # Generate the unpadded vocab size based on the tokenizer from the checkpoint
@@ -325,7 +382,7 @@ def build_and_load_model(
                 megatron_args.make_vocab_size_divisible_by,
                 model_cfg.tensor_model_parallel_size,
             )
-            provider = _gpt_provider if model_type == "gpt" else _mamba_provider
+            provider = _gpt_provider if model_type == "gpt" else _hybrid_provider
             return _get_model(megatron_args, provider, model_cfg)
 
     # Auto-detect if we should skip temp dist context
@@ -372,7 +429,7 @@ def build_and_load_model(
 
 def load_megatron_model(
     checkpoint_path: str,
-    model_type: Optional[Literal["gpt", "mamba"]] = None,
+    model_type: Optional[Literal["gpt", "hybrid", "mamba"]] = None,
     return_state_dict: bool = False,
     use_cpu_init: bool = False,
     skip_temp_dist_context: Optional[bool] = None,
@@ -386,7 +443,7 @@ def load_megatron_model(
         checkpoint_path: path to an MCore distributed checkpoint directory
                           (e.g., /path/to/model/checkpoints/iter_0000001).
         model_type: If the checkpoint is from MegatronLM, the model type is required. Currently,
-            only GPT and Mamba models are supported.
+            GPT and Hybrid models are supported; "mamba" is accepted as a deprecated alias.
         return_state_dict: If True, return the state dict instead of model instance. Default: False.
         use_cpu_init: If True, use CPU initialization context for the model and Gloo backend.
                      If False, use GPU initialization and NCCL backend. Default: False.
@@ -417,6 +474,7 @@ def load_megatron_model(
     model_cfg.hierarchical_context_parallel_sizes = None
     model_cfg.overlap_moe_expert_parallel_comm = False  # Required with EP=1
     model_cfg.delay_wgrad_compute = False  # Required with overlap=False
+    _disable_cuda_graphs_for_hybrid_load(model_cfg)
     if use_cpu_init:
         model_cfg.fp8 = None
         model_cfg.fp8_param = False
@@ -426,6 +484,11 @@ def load_megatron_model(
         for key, value in mp_overrides.items():
             if hasattr(model_cfg, key) and value is not None:
                 setattr(model_cfg, key, value)
+
+    # A saved flexible layout describes PP/VPP stage ownership. It must not be
+    # reinterpreted as virtual pipeline chunks after collapsing to one rank.
+    if model_cfg.pipeline_model_parallel_size == 1 and model_cfg.virtual_pipeline_model_parallel_size is None:
+        model_cfg.pipeline_model_parallel_layout = None
 
     # Flex dispatcher requires TPxEP > 1; fall back to allgather for single-rank export
     if getattr(model_cfg, "moe_token_dispatcher_type", None) == "flex":
