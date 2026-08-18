@@ -188,3 +188,6 @@ slurm*.out
 
 # UV package manager
 .uv/
+
+# Local analysis scratch space (never committed)
+scratchpad/
