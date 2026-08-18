@@ -152,7 +152,7 @@ DOCS_PORT ?= 8001
 .PHONY: help check-uv check-submodule \
 	docs-html docs-live docs-clean \
 	test-unit test-unit-core test-unit-diffusion \
-	test-unit-remote test-unit-core-remote test-unit-diffusion-remote \
+	test-unit-remote test-unit-core-remote test-unit-diffusion-remote test-shell-remote \
 	test-list test-logs test-teardown \
 	lint image-build-remote image-build-local buildx-builder-local \
 	check-promote image-promote-ci image-promote-latest \
@@ -173,6 +173,7 @@ help:
 	@echo "  make test-unit-remote            Both unit suites (CI: @flamingo run gpu-tests)"
 	@echo "  make test-unit-core-remote       Core suite only (CI: @flamingo run gpu-tests core)"
 	@echo "  make test-unit-diffusion-remote  Diffusion suite only (CI: @flamingo run gpu-tests diffusion)"
+	@echo "  make test-shell-remote           Interactive 2-GPU pod (stable name, re-run to re-sync tree)"
 	@echo "  make test-list                   List detached test jobs still running on the cluster"
 	@echo "  make test-logs [JOB=..]          Re-attach to a detached run's output (auto-selects if only one)"
 	@echo "  make test-teardown [JOB=..]      Stop a detached test job (JOB=all stops all)"
@@ -302,6 +303,12 @@ test-unit-core-remote:
 
 test-unit-diffusion-remote:
 	@$(REMOTE_TEST_ENV) TEST_SUITE='diffusion' bash tools/test_on_flamingo.sh
+
+# Interactive 2-GPU pod for iterative test runs: provisions (or reuses) a stable per-user shell
+# pod, rsyncs the working tree, and attaches. Re-run after local edits to re-sync into the same
+# pod. The pod stays up until `make test-teardown JOB=<user>-mbridge-shell`.
+test-shell-remote:
+	@$(REMOTE_TEST_ENV) bash tools/test_on_flamingo.sh shell
 
 # Manage detached remote runs. JOB=<name> selects a specific job; with one running it is
 # auto-selected; with several you get an interactive picker. `make test-teardown JOB=all` removes

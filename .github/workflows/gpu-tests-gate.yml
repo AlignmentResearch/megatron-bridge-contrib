@@ -63,13 +63,21 @@ jobs:
           # self-exempting. Missing/empty -> nothing is ignored.
           TESTIGNORE="$(git show "${BASE_SHA}:.testignore" 2>/dev/null || true)"
 
-          export CHANGED TESTIGNORE
+          # Hand the lists to Python through files, not the environment: a large PR
+          # (an upstream sync changes thousands of paths) overflows the exec
+          # argv+envp limit and the interpreter dies with "Argument list too long"
+          # before it can decide anything.
+          printf '%s' "$CHANGED" > "$RUNNER_TEMP/gate-changed.txt"
+          printf '%s' "$TESTIGNORE" > "$RUNNER_TEMP/gate-testignore.txt"
           SKIP="$(python3 <<'PY'
           import os
+          from pathlib import Path
+
           import pathspec
 
-          changed = [l for l in os.environ.get("CHANGED", "").splitlines() if l.strip()]
-          patterns = os.environ.get("TESTIGNORE", "").splitlines()
+          tmp = Path(os.environ["RUNNER_TEMP"])
+          changed = [l for l in (tmp / "gate-changed.txt").read_text().splitlines() if l.strip()]
+          patterns = [l for l in (tmp / "gate-testignore.txt").read_text().splitlines() if l.strip()]
           spec = pathspec.PathSpec.from_lines("gitwildmatch", patterns)
 
           # No .testignore patterns -> never skip. No changed files -> vacuously skip.

@@ -202,6 +202,7 @@ class Qwen3ASRThinkerModel(MegatronModule):
         inference_params: InferenceParams | None = None,
         packed_seq_params: PackedSeqParams | None = None,
         extra_block_kwargs: dict | None = None,
+        runtime_gather_output: bool | None = None,
         feature_attention_mask: torch.Tensor | None = None,
         audio_feature_lengths: torch.Tensor | None = None,
         **kwargs,
@@ -248,7 +249,9 @@ class Qwen3ASRThinkerModel(MegatronModule):
                 sp_pad_len = (tp_size - seq_len % tp_size) % tp_size
                 if sp_pad_len > 0:
                     combined_embeddings = torch.nn.functional.pad(combined_embeddings, (0, 0, 0, 0, 0, sp_pad_len))
-                combined_embeddings = tensor_parallel.scatter_to_sequence_parallel_region(combined_embeddings)
+                combined_embeddings = tensor_parallel.scatter_to_sequence_parallel_region(
+                    combined_embeddings, group=self.pg_collection.tp
+                )
                 combined_embeddings = combined_embeddings.contiguous()
         else:
             combined_embeddings = None
@@ -281,6 +284,7 @@ class Qwen3ASRThinkerModel(MegatronModule):
             loss_mask=loss_mask,
             inference_params=inference_params,
             packed_seq_params=packed_seq_params,
+            runtime_gather_output=runtime_gather_output,
             visual_pos_masks=None,
             deepstack_visual_embeds=None,
             **(extra_block_kwargs or {}),

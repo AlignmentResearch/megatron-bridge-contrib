@@ -14,6 +14,12 @@
 #             completion the Job is torn down (KEEP=1 leaves it up; FOLLOW=0 launches and returns
 #             without following). If the follow is interrupted, the tests keep running — re-attach
 #             with `logs` or clean up with `teardown`.
+#   shell     provision the same 2-GPU test pod (or REUSE one this action created earlier — the
+#             job name is stable per user), sync the tree, and attach an interactive shell for
+#             iterative test runs. Re-running `shell` re-syncs the current working tree into the
+#             live pod, so edit-locally/run-remotely loops need no new pod. Without a TTY it
+#             prints the `kubectl exec` invocation instead of attaching. The pod stays up until
+#             `teardown` — nothing is auto-torn-down on exit.
 #   logs      follow a running test job's output (reconnect-resilient).
 #   teardown  delete a test job (JOB=all deletes them all).
 #   list      list this user's local-dev test jobs.
@@ -119,7 +125,7 @@ follow_logs() {
 
 # ---- action dispatch -------------------------------------------------------------------------
 ACTION="${1:-${ACTION:-run}}"
-case "$ACTION" in run|logs|teardown|list) ;; *) echo "ERROR: unknown action '$ACTION' (run|logs|teardown|list)."; exit 1 ;; esac
+case "$ACTION" in run|shell|logs|teardown|list) ;; *) echo "ERROR: unknown action '$ACTION' (run|shell|logs|teardown|list)."; exit 1 ;; esac
 
 if [ "$ACTION" = "list" ]; then
   rows="$(list_test_jobs)"
@@ -172,7 +178,13 @@ rand_suffix() {
 }
 
 # Default to <username>-mbridge-test-<rand>. An explicit JOB_NAME is used verbatim (no suffix).
-JOB_NAME="${JOB_NAME:-${FLAMINGO_USERNAME:-${USER:-mbridge}}-mbridge-test-$(rand_suffix)}"
+# The shell action instead defaults to a STABLE per-user name so re-running it re-syncs into the
+# same live pod (the iterative loop) instead of provisioning a second one.
+if [ "$ACTION" = shell ]; then
+  JOB_NAME="${JOB_NAME:-${FLAMINGO_USERNAME:-${USER:-mbridge}}-mbridge-shell}"
+else
+  JOB_NAME="${JOB_NAME:-${FLAMINGO_USERNAME:-${USER:-mbridge}}-mbridge-test-$(rand_suffix)}"
+fi
 PRIORITY="${PRIORITY:-interactive}"
 IMAGE_REF="${IMAGE_REF:-ghcr.io/alignmentresearch/megatron-bridge:latest}"
 MANIFEST="${MANIFEST:-k8s/test-pod.yaml}"
@@ -224,6 +236,7 @@ esac
 # DNS-safe). Filter with e.g. `kubectl get jobs -l megatron-bridge.farai/user=<you>`.
 USER_LABEL="${FLAMINGO_USERNAME:-unknown}"
 SUITE_LABEL="${TEST_SUITE:-both}"
+[ "$ACTION" = shell ] && SUITE_LABEL="shell"
 
 REPO_ROOT="$(git rev-parse --show-toplevel)"
 
@@ -247,34 +260,50 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# ---- create the test job ---------------------------------------------------------------------
-kubectl delete job "$JOB_NAME" --ignore-not-found >/dev/null 2>&1 || true
-sed -e "s|__JOB_NAME__|${JOB_NAME}|g" \
-    -e "s|__PRIORITY__|${PRIORITY}|g" \
-    -e "s|__IMAGE__|${IMAGE_REF}|g" \
-    -e "s|__USER_LABEL__|${USER_LABEL}|g" \
-    -e "s|__SUITE_LABEL__|${SUITE_LABEL}|g" \
-    -e "s|__TEST_GPUS__|${TEST_GPUS}|g" \
-    -e "s|__TEST_CPU__|${TEST_CPU}|g" \
-    -e "s|__TEST_MEM__|${TEST_MEM}|g" \
-    -e "s|__TEST_DISK__|${TEST_DISK}|g" \
-    -e "s|__IMAGE_PULL_POLICY__|${IMAGE_PULL_POLICY}|g" \
-    "$REPO_ROOT/$MANIFEST" | kubectl create -f -
+# ---- create the test job (or, for shell, reuse a live one) -----------------------------------
+# The shell action's job name is stable, so a running pod from an earlier `shell` is picked up
+# and only re-synced — that is the iterative loop. A reused pod must never be torn down by the
+# early-failure trap: it predates this invocation.
+REUSED=0
+if [ "$ACTION" = shell ]; then
+  POD="$(kubectl get pods -l job-name="$JOB_NAME" --field-selector=status.phase=Running \
+        -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)"
+  if [ -n "$POD" ]; then
+    REUSED=1
+    LAUNCHED=1
+    echo "▶ Reusing running shell pod $POD (job $JOB_NAME)"
+  fi
+fi
 
-# ---- wait for the pod to be running ----------------------------------------------------------
-echo "▶ Waiting for test pod (timeout ${READY_TIMEOUT}s; needs ${TEST_GPUS} GPUs via kueue)…"
-deadline=$(( $(date +%s) + READY_TIMEOUT ))
-POD=""
-while :; do
-  POD="$(kubectl get pods -l job-name="$JOB_NAME" -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)"
-  [ -n "$POD" ] && break
-  [ "$(date +%s)" -ge "$deadline" ] && {
-    echo "ERROR: test pod never scheduled (kueue admission / GPU quota?). Check: kubectl describe job $JOB_NAME"
-    exit 1
-  }
-  sleep 3
-done
-kubectl wait --for=condition=ready "pod/$POD" --timeout="${READY_TIMEOUT}s"
+if [ "$REUSED" != 1 ]; then
+  kubectl delete job "$JOB_NAME" --ignore-not-found >/dev/null 2>&1 || true
+  sed -e "s|__JOB_NAME__|${JOB_NAME}|g" \
+      -e "s|__PRIORITY__|${PRIORITY}|g" \
+      -e "s|__IMAGE__|${IMAGE_REF}|g" \
+      -e "s|__USER_LABEL__|${USER_LABEL}|g" \
+      -e "s|__SUITE_LABEL__|${SUITE_LABEL}|g" \
+      -e "s|__TEST_GPUS__|${TEST_GPUS}|g" \
+      -e "s|__TEST_CPU__|${TEST_CPU}|g" \
+      -e "s|__TEST_MEM__|${TEST_MEM}|g" \
+      -e "s|__TEST_DISK__|${TEST_DISK}|g" \
+      -e "s|__IMAGE_PULL_POLICY__|${IMAGE_PULL_POLICY}|g" \
+      "$REPO_ROOT/$MANIFEST" | kubectl create -f -
+
+  # ---- wait for the pod to be running --------------------------------------------------------
+  echo "▶ Waiting for test pod (timeout ${READY_TIMEOUT}s; needs ${TEST_GPUS} GPUs via kueue)…"
+  deadline=$(( $(date +%s) + READY_TIMEOUT ))
+  POD=""
+  while :; do
+    POD="$(kubectl get pods -l job-name="$JOB_NAME" -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)"
+    [ -n "$POD" ] && break
+    [ "$(date +%s)" -ge "$deadline" ] && {
+      echo "ERROR: test pod never scheduled (kueue admission / GPU quota?). Check: kubectl describe job $JOB_NAME"
+      exit 1
+    }
+    sleep 3
+  done
+  kubectl wait --for=condition=ready "pod/$POD" --timeout="${READY_TIMEOUT}s"
+fi
 
 # ---- sync the working tree into the pod ------------------------------------------------------
 echo "▶ Syncing working tree into $POD:$REMOTE_DIR (rsync; incremental + resumable)"
@@ -311,8 +340,12 @@ if [ "$_have_rsync" = 1 ]; then
     # examples/**/slurm_conversion.sh wrappers run `git rev-parse --show-toplevel`, and
     # test_mcore_commit runs `git ls-tree HEAD 3rdparty/Megatron-LM`. CI gets a real repo because
     # it clones; without .git those tests fail with "not a git repository" (exit 128).
+    # .claude/.agents are agent-tooling symlink farms (also inside the submodule); the image
+    # carries REAL directories at those paths, which neither rsync nor tar can replace with a
+    # symlink — and the tests never read them. Exclude at any depth.
     if rsync -rlptz --timeout=180 \
          --filter=':- .gitignore' --exclude='.venv' --exclude='__pycache__' \
+         --exclude='.claude' --exclude='.agents' \
          -e "$_krsync" "$REPO_ROOT"/ "mbridge:$REMOTE_DIR"/; then
       _synced=1; break
     fi
@@ -343,12 +376,28 @@ if [ "$_synced" != 1 ]; then
   # .git itself (neither --cached nor --others), so it has to be added explicitly. The submodule's
   # .git is a pointer FILE ("gitdir: ../../.git/modules/3rdparty/Megatron-LM") whose relative path
   # resolves correctly once .git/modules is in place, so both parts must ship together.
+  # The grep drops .claude/.agents at any depth for the same reason as the rsync excludes
+  # above: symlink farms colliding with real directories in the image.
   ( cd "$REPO_ROOT" && { git ls-files -z --cached --recurse-submodules; \
                          git ls-files -z --others --exclude-standard; \
                          find .git \( -type f -o -type l \) -print0; \
                          [ -e 3rdparty/Megatron-LM/.git ] && printf '3rdparty/Megatron-LM/.git\0'; } \
+      | grep -zvE '(^|/)\.(claude|agents)(/|$)' \
       | COPYFILE_DISABLE=1 tar --null -T - -czf - ) \
     | kubectl exec -i "$POD" -c "$CONTAINER" -- tar --warning=no-unknown-keyword -xzf - -C "$REMOTE_DIR"
+fi
+
+# ---- shell action: attach (or print how to exec) instead of launching the suites -------------
+if [ "$ACTION" = shell ]; then
+  LAUNCHED=1   # the live pod is the deliverable; never torn down on exit — use `teardown`
+  echo "▶ Shell pod ready: $POD (job $JOB_NAME, ${TEST_GPUS} GPUs)"
+  echo "    re-sync tree   : re-run this action (pod is reused, rsync is incremental)"
+  echo "    one-off command: kubectl exec $POD -c $CONTAINER -- bash -lc 'cd $REMOTE_DIR && <cmd>'"
+  echo "    teardown       : JOB=$JOB_NAME bash tools/test_on_flamingo.sh teardown"
+  if [ -t 0 ] && [ -t 1 ]; then
+    exec kubectl exec -it "$POD" -c "$CONTAINER" -- bash -c "cd '$REMOTE_DIR' && exec bash -l"
+  fi
+  exit 0
 fi
 
 # ---- launch the tests DETACHED on the pod ----------------------------------------------------
