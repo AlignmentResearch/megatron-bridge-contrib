@@ -12,20 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Uniqueness of the sharded checkpoint an expert adapter describes, across a whole world.
+"""Global checkpoint identity for grouped-expert adapters.
 
-A `_extra_state` entry becomes a `ShardedObject`, and a `ShardedObject` carries no shard offsets:
-the only thing distinguishing one rank's copy from another's is `replica_id`. Megatron requires
-exactly one rank per key to be the main replica, so a `replica_id` that collapses several ranks
-onto the all-zero value makes `validate_sharding_integrity` raise and takes the training run down
-at its first save. Every assertion here is about that global picture, which means the interesting
-part cannot be seen from a single rank -- the tests build one adapter per rank of a simulated
-world and look at the shardings together.
-
-Only the ranks are simulated. The `ShardedObject`s and `ShardedTensor`s come from megatron's own
-`make_sharded_tensors_for_checkpoint`, so the convention the adapter is checked against is
-megatron's convention rather than a constant transcribed into this file, and the verdict comes
-from megatron's own `validate_sharding_integrity`.
+The tests simulate a complete EP/ETP/EDP world and validate the resulting global
+expert-axis sharding with Megatron's own integrity checker. Tensor shards must be
+distinct across EP partitions while unsharded extra state has one main replica.
 """
 
 import datetime
@@ -39,13 +30,13 @@ import torch
 import torch.distributed as dist
 from megatron.core import parallel_state
 from megatron.core.dist_checkpointing.dict_utils import nested_values
-from megatron.core.dist_checkpointing.mapping import ShardedObject, apply_factories, is_main_replica
+from megatron.core.dist_checkpointing.mapping import ShardedObject, ShardedTensor, apply_factories, is_main_replica
 from megatron.core.dist_checkpointing.utils import extract_sharded_base
 from megatron.core.dist_checkpointing.validation import validate_sharding_integrity
 from megatron.core.model_parallel_config import ModelParallelConfig
 from megatron.core.transformer.utils import make_sharded_tensors_for_checkpoint
 
-from megatron.bridge.peft.utils import ParallelLinearAdapter
+from megatron.bridge.peft.utils import ParallelLinearAdapter, _enable_legacy_shared_expert_adapter_loading
 
 
 # The grouped-expert path: `mlp.experts` is the TEGroupedMLP, whose sharded_state_dict prepends a
@@ -122,13 +113,14 @@ def _base_linear_sharded_state_dict(prefix: str, rows: int, cols: int, rank: Ran
     )
 
 
-def _adapter_shardings(rank: Rank, is_expert: bool = True) -> list:
-    """Build the adapter as `rank` would and return the shardings it contributes to the save.
-
-    The two inner linears are stubbed so the adapter can be built without a real process group,
-    but what they return is real megatron sharded state for this rank. Factories are applied and
-    the result flattened exactly as `dist_checkpointing.save` does before it validates.
-    """
+def _make_adapter(
+    rank: Rank,
+    *,
+    is_expert: bool = True,
+    base_linear_name: str = "experts.linear_fc1",
+    gated_linear_unit: bool = True,
+) -> ParallelLinearAdapter:
+    """Build an adapter whose inner linears emit real Megatron sharding metadata."""
     linear_in, linear_out = Mock(), Mock()
     linear_in.sharded_state_dict.side_effect = lambda prefix, offsets, metadata: _base_linear_sharded_state_dict(
         prefix, DIM // rank.world.etp_size, IN_FEATURES, rank
@@ -142,18 +134,36 @@ def _adapter_shardings(rank: Rank, is_expert: bool = True) -> list:
         expert_tensor_parallel_size=rank.world.etp_size,
         expert_model_parallel_size=rank.world.ep_size,
     )
+    config.num_moe_experts = rank.world.ep_size * 2
+    config.gated_linear_unit = gated_linear_unit
     with (
         patch("megatron.bridge.peft.utils.ColumnParallelLinear", side_effect=[linear_in, linear_out]),
         patch("megatron.bridge.peft.utils.RowParallelLinear"),
     ):
-        adapter = ParallelLinearAdapter(
+        return ParallelLinearAdapter(
             in_features=IN_FEATURES,
             out_features=OUT_FEATURES,
             dim=DIM,
-            base_linear_name="experts.linear_fc1",
+            base_linear_name=base_linear_name,
             is_expert=is_expert,
             model_parallel_config=config,
         )
+
+
+def _adapter_shardings(
+    rank: Rank,
+    *,
+    is_expert: bool = True,
+    base_linear_name: str = "experts.linear_fc1",
+    gated_linear_unit: bool = True,
+) -> list:
+    """Return the adapter shardings contributed by a simulated rank."""
+    adapter = _make_adapter(
+        rank,
+        is_expert=is_expert,
+        base_linear_name=base_linear_name,
+        gated_linear_unit=gated_linear_unit,
+    )
 
     # Every expert coordinate this rank could be asked for, so the assertions are about what the
     # adapter does with them rather than about which of them it happens to read.
@@ -176,7 +186,7 @@ def _adapter_shardings(rank: Rank, is_expert: bool = True) -> list:
 
 def _global_metadata(world: World, is_expert: bool = True) -> list[list]:
     """The per-rank shardings megatron gathers on rank 0 before validating a save."""
-    return [_adapter_shardings(rank, is_expert) for rank in world.ranks()]
+    return [_adapter_shardings(rank, is_expert=is_expert) for rank in world.ranks()]
 
 
 def _main_replica_object_keys(global_metadata: list[list]) -> list[str]:
@@ -249,34 +259,90 @@ def test_megatron_accepts_the_gathered_sharding(world: World) -> None:
     validate_sharding_integrity(_global_metadata(world))
 
 
-def test_expert_tensor_parallel_rank_survives_in_replica_id() -> None:
-    """Slot 1 keeps meaning the expert-TP rank, as TEGroupedLinear leaves it.
-
-    This is the property whose loss produced the duplicate keys, asserted directly so a future
-    change that reintroduces it fails here and not only in the world-level test above.
-    """
+def test_extra_state_is_kept_only_on_the_main_expert_rank() -> None:
+    """Only EP0/ETP0 contributes unsharded adapter extra state."""
     world = World(etp_size=4, ep_size=1, edp_size=2)
     for rank in world.ranks():
         replica_ids = _extra_state_replica_ids(_adapter_shardings(rank))
-        assert set(replica_ids) == {f"{PREFIX}linear_in._extra_state", f"{PREFIX}linear_out._extra_state"}
-        for key, replica_id in replica_ids.items():
-            assert replica_id[1] == rank.etp, f"{key} on {rank} lost the expert-TP rank: {replica_id}"
+        if rank.ep == 0 and rank.etp == 0:
+            assert set(replica_ids) == {f"{PREFIX}linear_in._extra_state", f"{PREFIX}linear_out._extra_state"}
+        else:
+            assert replica_ids == {}
 
 
-def test_expert_parallel_identity_survives_the_optimizer_truncation() -> None:
-    """Whatever separates EP ranks has to sit in the first two slots of replica_id.
-
-    The distributed optimizer builds its shardings from these, keeping `replica_id[:2]` and
-    overwriting the last slot with its instance id. An EP identity parked in the last slot is
-    therefore erased, and the optimizer state collides on keys where the model state did not.
-    """
+def test_expert_parallel_identity_is_a_global_tensor_axis() -> None:
+    """EP-local values occupy distinct global expert offsets rather than replica ids."""
     world = World(etp_size=2, ep_size=2, edp_size=2)
-    heads: dict[str, dict[tuple[int, int], tuple]] = {}
+    offsets_by_ep = {}
     for rank in world.ranks():
-        for key, replica_id in _extra_state_replica_ids(_adapter_shardings(rank)).items():
-            heads.setdefault(key, {})[(rank.ep, rank.etp)] = replica_id[:2]
-    for key, by_rank in heads.items():
-        assert len(set(by_rank.values())) == len(by_rank), f"{key} collapses EP/ETP ranks: {by_rank}"
+        if rank.etp != 0 or rank.edp != 0:
+            continue
+        tensor_offsets = {
+            tuple(sharding.global_offset)
+            for sharding in _adapter_shardings(rank)
+            if isinstance(sharding, ShardedTensor)
+        }
+        offsets_by_ep[rank.ep] = tensor_offsets
+    assert offsets_by_ep[0].isdisjoint(offsets_by_ep[1])
+
+
+def test_resharding_distinct_expert_slots_fails_closed() -> None:
+    """A shared runtime adapter cannot represent unequal expert-slot values."""
+    rank = Rank(etp=0, ep=0, edp=0, world=World(etp_size=1, ep_size=2, edp_size=1))
+    adapter = _make_adapter(rank)
+    with (
+        patch.object(parallel_state, "get_expert_model_parallel_rank", return_value=rank.ep),
+        patch.object(parallel_state, "get_expert_model_parallel_world_size", return_value=rank.world.ep_size),
+    ):
+        factory = adapter._apply_expert_axis_factory(
+            _base_linear_sharded_state_dict("adapter.", DIM, IN_FEATURES, rank)["adapter.weight"], ()
+        )
+
+    with pytest.raises(RuntimeError, match="Cannot merge distinct global expert slots"):
+        factory.merge_fn([torch.zeros(DIM, IN_FEATURES), torch.ones(DIM, IN_FEATURES)])
+
+
+def test_legacy_schema_detection_fails_closed_on_missing_metadata() -> None:
+    """A PEFT resume never guesses the schema of an unresolved grouped adapter."""
+    rank = Rank(etp=0, ep=0, edp=0, world=World(etp_size=1, ep_size=2, edp_size=1))
+    adapter = _make_adapter(rank)
+    with (
+        patch.object(parallel_state, "get_expert_model_parallel_rank", return_value=rank.ep),
+        patch.object(parallel_state, "get_expert_model_parallel_world_size", return_value=rank.world.ep_size),
+        patch.object(parallel_state, "get_expert_tensor_parallel_rank", return_value=rank.etp),
+        patch.object(parallel_state, "get_expert_data_parallel_rank", return_value=rank.edp),
+    ):
+        state_dict = {"model": adapter.sharded_state_dict(prefix=PREFIX)}
+        with patch("megatron.bridge.peft.utils.dist_checkpointing.load_tensors_metadata", return_value={}):
+            with pytest.raises(RuntimeError, match="missing from checkpoint tensor metadata"):
+                _enable_legacy_shared_expert_adapter_loading(adapter, state_dict, "/checkpoint")
+
+
+def test_global_expert_axis_factory_preserves_etp_swiglu_values() -> None:
+    """ETP-local gate/up halves retain fused ordering through factory build and merge."""
+    rank = Rank(etp=1, ep=0, edp=0, world=World(etp_size=2, ep_size=2, edp_size=1))
+    adapter = _make_adapter(rank)
+    local_rows = OUT_FEATURES // rank.world.etp_size
+    source = torch.cat(
+        (
+            torch.full((local_rows // 2, DIM), 3.0),
+            torch.full((local_rows // 2, DIM), 7.0),
+        )
+    )
+    sharded_tensor = _base_linear_sharded_state_dict("adapter.", local_rows, DIM, rank)["adapter.weight"]
+    with (
+        patch.object(parallel_state, "get_expert_model_parallel_rank", return_value=rank.ep),
+        patch.object(parallel_state, "get_expert_model_parallel_world_size", return_value=rank.world.ep_size),
+    ):
+        factory = adapter._apply_expert_axis_factory(sharded_tensor, (), split_swiglu=True)
+
+    built = factory.build_fn(factory.key, source, factory.replica_id, None)
+    assert len(built) == 4
+    for expert_index in range(2):
+        gate, up = built[expert_index * 2 : expert_index * 2 + 2]
+        torch.testing.assert_close(gate.data, torch.full_like(gate.data, 3.0))
+        torch.testing.assert_close(up.data, torch.full_like(up.data, 7.0))
+    torch.testing.assert_close(factory.merge_fn([shard.data for shard in built]), source)
 
 
 def test_non_expert_adapter_keeps_megatron_replica_ids() -> None:
@@ -284,3 +350,21 @@ def test_non_expert_adapter_keeps_megatron_replica_ids() -> None:
     rank = Rank(etp=2, ep=0, edp=1, world=World(etp_size=4, ep_size=1, edp_size=2))
     replica_ids = _extra_state_replica_ids(_adapter_shardings(rank, is_expert=False))
     assert set(replica_ids.values()) == {(0, rank.etp, rank.dp_rank)}
+
+
+def test_non_grouped_expert_adapter_preserves_legacy_sharding() -> None:
+    """Per-expert adapters retain flattened EP/ETP identity and FC1 splitting."""
+    rank = Rank(etp=1, ep=1, edp=0, world=World(etp_size=2, ep_size=2, edp_size=2))
+    shardings = _adapter_shardings(
+        rank,
+        base_linear_name="mlp.experts.local_experts.1.linear_fc1",
+        gated_linear_unit=False,
+    )
+    replica_ids = _extra_state_replica_ids(shardings)
+    assert set(replica_ids.values()) == {(0, rank.ep * rank.world.etp_size + rank.etp, rank.dp_rank)}
+    linear_out_shards = [
+        sharding
+        for sharding in shardings
+        if isinstance(sharding, ShardedTensor) and sharding.key == f"{PREFIX}linear_out.weight"
+    ]
+    assert len(linear_out_shards) == 2

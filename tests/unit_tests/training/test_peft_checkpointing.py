@@ -31,6 +31,7 @@ from megatron.bridge.peft.base import PEFT
 from megatron.bridge.peft.lora import LoRA
 from megatron.bridge.training.checkpointing import (
     _is_model_section,
+    _prepare_legacy_shared_expert_adapter_checkpoint_load,
     apply_peft_adapter_filter_to_state_dict,
     load_checkpoint,
 )
@@ -98,6 +99,63 @@ class TestIsModelSection:
         assert _is_model_section("") == False
         assert _is_model_section("model00") == True  # Leading zeros are valid digits
         assert _is_model_section("model01") == True
+
+
+class TestPrepareLegacySharedExpertAdapterCheckpointLoad:
+    """Training migration rebuilds filtered PEFT state for legacy adapters."""
+
+    @patch("megatron.bridge.training.checkpointing._enable_legacy_shared_expert_adapter_loading")
+    def test_current_schema_keeps_existing_state_dict(self, enable_legacy_loading):
+        state_dict = {"model": {"adapter": object()}}
+        regenerate_state_dict = Mock()
+        enable_legacy_loading.return_value = ()
+
+        prepared, adapters = _prepare_legacy_shared_expert_adapter_checkpoint_load(
+            model=[Mock()],
+            sharded_state_dict=state_dict,
+            checkpoint_name="/checkpoint",
+            regenerate_state_dict=regenerate_state_dict,
+        )
+
+        assert prepared is state_dict
+        assert adapters == ()
+        regenerate_state_dict.assert_not_called()
+
+    @patch("megatron.bridge.training.checkpointing._enable_legacy_shared_expert_adapter_loading")
+    def test_legacy_schema_rebuilds_marked_adapter_state_dict(self, enable_legacy_loading):
+        state_dict = {"model": {"adapter": "current-factory"}}
+        rebuilt_state_dict = {"model": {"adapter": "legacy-2d"}}
+        adapter = Mock()
+        regenerate_state_dict = Mock(return_value=rebuilt_state_dict)
+        enable_legacy_loading.return_value = (adapter,)
+
+        prepared, adapters = _prepare_legacy_shared_expert_adapter_checkpoint_load(
+            model=[Mock()],
+            sharded_state_dict=state_dict,
+            checkpoint_name="/checkpoint",
+            regenerate_state_dict=regenerate_state_dict,
+        )
+
+        assert prepared is rebuilt_state_dict
+        assert adapters == (adapter,)
+        regenerate_state_dict.assert_called_once_with()
+
+    @patch("megatron.bridge.training.checkpointing._disable_legacy_shared_expert_adapter_loading")
+    @patch("megatron.bridge.training.checkpointing._enable_legacy_shared_expert_adapter_loading")
+    def test_failed_regeneration_restores_current_schema(self, enable_legacy_loading, disable_legacy_loading):
+        adapter = Mock()
+        enable_legacy_loading.return_value = (adapter,)
+        regenerate_state_dict = Mock(side_effect=RuntimeError("regeneration failed"))
+
+        with pytest.raises(RuntimeError, match="regeneration failed"):
+            _prepare_legacy_shared_expert_adapter_checkpoint_load(
+                model=[Mock()],
+                sharded_state_dict={"model": {}},
+                checkpoint_name="/checkpoint",
+                regenerate_state_dict=regenerate_state_dict,
+            )
+
+        disable_legacy_loading.assert_called_once_with((adapter,))
 
 
 class TestApplyPeftAdapterFilterToStateDict:
