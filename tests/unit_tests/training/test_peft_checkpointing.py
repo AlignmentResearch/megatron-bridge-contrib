@@ -494,10 +494,10 @@ class TestPEFTCheckpointLoading:
     @patch("megatron.bridge.training.checkpointing.apply_peft_adapter_filter_to_state_dict")
     @patch("megatron.bridge.training.checkpointing.generate_state_dict")
     @patch("megatron.bridge.training.checkpointing.dist_checkpointing")
-    def test_load_checkpoint_peft_resume_detection(
+    def test_load_checkpoint_peft_resume_wires_legacy_migration(
         self, mock_dist_ckpt, mock_generate_state_dict, mock_filter, mock_checkpoint_exists, mock_load_base
     ):
-        """Test that PEFT resume is properly detected and triggers filtering."""
+        """Test PEFT resume filtering and legacy expert-adapter migration wiring."""
         # Setup mocks
         mock_checkpoint_exists.return_value = True
 
@@ -561,6 +561,7 @@ class TestPEFTCheckpointLoading:
         # Create mock model
         mock_model = [Mock()]
         mock_model[0].load_state_dict = Mock()
+        legacy_adapter = Mock()
 
         # Call load_checkpoint
         with (
@@ -575,6 +576,13 @@ class TestPEFTCheckpointLoading:
             patch("megatron.bridge.training.checkpointing.unwrap_model") as mock_unwrap_model,
             patch("megatron.bridge.training.checkpointing.get_pg_collection") as mock_get_pg_collection,
             patch("os.path.exists") as mock_exists,
+            patch(
+                "megatron.bridge.training.checkpointing._prepare_legacy_shared_expert_adapter_checkpoint_load",
+                return_value=(filtered_sharded_state_dict, (legacy_adapter,)),
+            ) as mock_prepare_legacy_load,
+            patch(
+                "megatron.bridge.training.checkpointing._disable_legacy_shared_expert_adapter_loading"
+            ) as mock_disable_legacy_load,
         ):
             mock_read_train_state.return_value = mock_state.train_state
             mock_get_version.return_value = 3.0
@@ -602,7 +610,7 @@ class TestPEFTCheckpointLoading:
             # Mock generate_state_dict to return the full state dict (before filtering)
             mock_generate_state_dict.return_value = full_generated_state_dict
 
-            # Mock run config for non-PEFT scenario
+            # Mock run config for the PEFT resume checkpoint.
             mock_run_config = {
                 "model": {
                     "tensor_model_parallel_size": 1,
@@ -624,6 +632,13 @@ class TestPEFTCheckpointLoading:
 
             # Verify PEFT filtering was called on the generated sharded state dict
             mock_filter.assert_called_once_with(full_generated_state_dict, mock_cfg.peft)
+
+            mock_prepare_legacy_load.assert_called_once()
+            prepare_kwargs = mock_prepare_legacy_load.call_args.kwargs
+            assert prepare_kwargs["model"] is mock_model
+            assert prepare_kwargs["sharded_state_dict"] is filtered_sharded_state_dict
+            assert callable(prepare_kwargs["regenerate_state_dict"])
+            mock_disable_legacy_load.assert_called_once_with((legacy_adapter,))
 
             # Verify model.load_state_dict was called with filtered dict and strict=False
             mock_model[0].load_state_dict.assert_called_once_with(filtered_sharded_state_dict["model"], strict=False)
