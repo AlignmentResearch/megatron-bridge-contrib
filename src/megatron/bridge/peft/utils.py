@@ -237,46 +237,39 @@ def _checkpoint_tensor_shape(checkpoint_metadata: Mapping[str, ShardedTensor], k
 
 def _shared_expert_adapter_factory_info(
     factory: ShardedTensorFactory,
-) -> tuple[str, tuple[int, ...]] | None:
-    """Return the adapter key and new-schema shape represented by a factory."""
+) -> tuple[tuple[int, ...], int]:
+    """Return the new-schema shape and expert-axis index represented by a factory."""
 
-    for suffix in (".linear_in.weight", ".linear_out.weight"):
-        if not factory.key.endswith(suffix):
-            continue
-        built = factory.build()
-        shards = built if isinstance(built, list) else [built]
-        if not shards or not isinstance(shards[0], ShardedTensor):
-            return None
-        expected_shape = tuple(shards[0].global_shape)
-        if len(expected_shape) == factory.data.ndim + 1:
-            return factory.key[: -len(suffix)], expected_shape
-    return None
+    built = factory.build()
+    shards = built if isinstance(built, list) else [built]
+    if not shards or any(not isinstance(shard, ShardedTensor) for shard in shards):
+        raise RuntimeError(f"Grouped-expert adapter factory {factory.key!r} did not build tensor shards")
+    expected_shape = tuple(shards[0].global_shape)
+    if any(tuple(shard.global_shape) != expected_shape for shard in shards[1:]):
+        raise RuntimeError(f"Grouped-expert adapter factory {factory.key!r} built inconsistent global shapes")
+    expert_axis = len(expected_shape) - factory.data.ndim - 1
+    if expert_axis < 0:
+        raise RuntimeError(
+            f"Grouped-expert adapter factory {factory.key!r} has no global expert axis: "
+            f"global_shape={expected_shape}, local_shape={tuple(factory.data.shape)}"
+        )
+    return expected_shape, expert_axis
 
 
-def _matching_shared_expert_adapters(
-    adapters_by_name: list[tuple[str, "ParallelLinearAdapter"]], adapter_key: str
-) -> list["ParallelLinearAdapter"]:
-    """Return model adapter candidates for a checkpoint adapter key."""
+def _grouped_expert_adapter_parameter_owners(
+    adapters: list["ParallelLinearAdapter"],
+) -> dict[int, tuple["ParallelLinearAdapter", str, torch.Tensor]]:
+    """Index grouped-adapter weights by stable in-memory identity."""
 
-    exact_matches = [adapter for name, adapter in adapters_by_name if name == adapter_key]
-    if exact_matches:
-        return exact_matches
-
-    adapter_base_key = adapter_key.removesuffix(".adapter")
-    matches = []
-    for module_name, module in adapters_by_name:
-        module_base_key = module_name.removesuffix(".adapter")
-        base_linear_name = module.base_linear_name
-        if (
-            adapter_key.endswith(module_name)
-            or module_name.endswith(adapter_key)
-            or adapter_base_key.endswith(module_base_key)
-            or module_base_key.endswith(adapter_base_key)
-            or adapter_base_key.endswith(base_linear_name)
-            or base_linear_name.endswith(adapter_base_key)
-        ):
-            matches.append(module)
-    return matches
+    owners: dict[int, tuple[ParallelLinearAdapter, str, torch.Tensor]] = {}
+    for adapter in adapters:
+        for component, linear in (("linear_in", adapter.linear_in), ("linear_out", adapter.linear_out)):
+            weight = linear.weight
+            owner = (adapter, component, weight)
+            previous = owners.setdefault(id(weight), owner)
+            if previous[2] is not weight or previous[:2] != owner[:2]:
+                raise RuntimeError("Grouped-expert adapter parameters have ambiguous ownership")
+    return owners
 
 
 def _enable_legacy_shared_expert_adapter_loading(
@@ -301,21 +294,32 @@ def _enable_legacy_shared_expert_adapter_loading(
         Adapters temporarily marked to emit legacy 2D sharding.
     """
 
-    checkpoint_metadata = dist_checkpointing.load_tensors_metadata(str(checkpoint_path))
     models = megatron_model if isinstance(megatron_model, list) else [megatron_model]
-    adapters_by_name = [
-        (name.removeprefix("module."), module)
-        for model in models
-        for name, module in model.named_modules()
-        if isinstance(module, ParallelLinearAdapter) and module._uses_grouped_expert_sharding()
-    ]
+    adapters = list(
+        dict.fromkeys(
+            module
+            for model in models
+            for module in model.modules()
+            if isinstance(module, ParallelLinearAdapter) and module._uses_grouped_expert_sharding()
+        )
+    )
+    if not adapters:
+        return ()
+    parameter_owners = _grouped_expert_adapter_parameter_owners(adapters)
+    checkpoint_metadata = dist_checkpointing.load_tensors_metadata(str(checkpoint_path))
 
-    legacy_adapters: set[ParallelLinearAdapter] = set()
+    component_schemas: dict[tuple[ParallelLinearAdapter, str], bool] = {}
     for factory in _iter_sharded_tensor_factories(sharded_state_dict):
-        factory_info = _shared_expert_adapter_factory_info(factory)
-        if factory_info is None:
+        owner = parameter_owners.get(id(factory.data))
+        if owner is None:
             continue
-        adapter_key, expected_shape = factory_info
+        adapter, component, owner_weight = owner
+        if factory.data is not owner_weight:
+            raise RuntimeError(f"Grouped-expert adapter factory {factory.key!r} has an invalid parameter identity")
+        component_key = (adapter, component)
+        if component_key in component_schemas:
+            raise RuntimeError(f"Grouped-expert adapter component {factory.key!r} has duplicate checkpoint factories")
+        expected_shape, expert_axis = _shared_expert_adapter_factory_info(factory)
         checkpoint_shape = _checkpoint_tensor_shape(checkpoint_metadata, factory.key)
         if checkpoint_shape is None:
             raise RuntimeError(
@@ -323,20 +327,30 @@ def _enable_legacy_shared_expert_adapter_loading(
                 "refusing to guess its checkpoint schema"
             )
         if checkpoint_shape == expected_shape:
+            component_schemas[component_key] = False
             continue
-        if checkpoint_shape != expected_shape[1:]:
+        legacy_shape = expected_shape[:expert_axis] + expected_shape[expert_axis + 1 :]
+        if checkpoint_shape != legacy_shape:
             raise RuntimeError(
                 f"Unsupported grouped-expert adapter checkpoint shape for {factory.key}: "
-                f"checkpoint={checkpoint_shape}, expected current={expected_shape} or legacy={expected_shape[1:]}"
+                f"checkpoint={checkpoint_shape}, expected current={expected_shape} or legacy={legacy_shape}"
             )
+        component_schemas[component_key] = True
 
-        matches = _matching_shared_expert_adapters(adapters_by_name, adapter_key)
-        if len(matches) != 1:
+    legacy_adapters = []
+    for adapter in adapters:
+        schemas = [component_schemas.get((adapter, component)) for component in ("linear_in", "linear_out")]
+        if any(schema is None for schema in schemas):
             raise RuntimeError(
-                f"Legacy grouped-expert adapter key {adapter_key!r} matched {len(matches)} model adapters; "
-                "refusing an ambiguous checkpoint migration"
+                f"Grouped-expert adapter {adapter.base_linear_name!r} is missing a checkpoint factory; "
+                "refusing to guess its checkpoint schema"
             )
-        legacy_adapters.add(matches[0])
+        if schemas[0] != schemas[1]:
+            raise RuntimeError(
+                f"Grouped-expert adapter {adapter.base_linear_name!r} mixes current and legacy checkpoint schemas"
+            )
+        if schemas[0] is True:
+            legacy_adapters.append(adapter)
 
     for adapter in legacy_adapters:
         adapter._use_legacy_shared_expert_adapter_checkpoint = True

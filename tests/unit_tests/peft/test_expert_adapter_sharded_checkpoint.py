@@ -30,7 +30,13 @@ import torch
 import torch.distributed as dist
 from megatron.core import parallel_state
 from megatron.core.dist_checkpointing.dict_utils import nested_values
-from megatron.core.dist_checkpointing.mapping import ShardedObject, ShardedTensor, apply_factories, is_main_replica
+from megatron.core.dist_checkpointing.mapping import (
+    ShardedObject,
+    ShardedTensor,
+    ShardedTensorFactory,
+    apply_factories,
+    is_main_replica,
+)
 from megatron.core.dist_checkpointing.utils import extract_sharded_base
 from megatron.core.dist_checkpointing.validation import validate_sharding_integrity
 from megatron.core.model_parallel_config import ModelParallelConfig
@@ -94,7 +100,9 @@ class _FakeProcessGroup:
         return self._size
 
 
-def _base_linear_sharded_state_dict(prefix: str, rows: int, cols: int, rank: Rank) -> dict:
+def _base_linear_sharded_state_dict(
+    prefix: str, rows: int, cols: int, rank: Rank, sharded_offsets: tuple = ()
+) -> dict:
     """What megatron-core's ColumnParallelLinear emits for `rank`.
 
     Mirrors ColumnParallelLinear.sharded_state_dict: axis-0 sharding for the weight, no bias, and
@@ -107,7 +115,7 @@ def _base_linear_sharded_state_dict(prefix: str, rows: int, cols: int, rank: Ran
         state_dict,
         prefix,
         {"weight": 0},
-        (),
+        sharded_offsets,
         tp_group=_FakeProcessGroup(rank.etp, rank.world.etp_size),
         dp_cp_group=_FakeProcessGroup(rank.dp_rank, rank.dp_size),
     )
@@ -122,12 +130,21 @@ def _make_adapter(
 ) -> ParallelLinearAdapter:
     """Build an adapter whose inner linears emit real Megatron sharding metadata."""
     linear_in, linear_out = Mock(), Mock()
-    linear_in.sharded_state_dict.side_effect = lambda prefix, offsets, metadata: _base_linear_sharded_state_dict(
-        prefix, DIM // rank.world.etp_size, IN_FEATURES, rank
-    )
-    linear_out.sharded_state_dict.side_effect = lambda prefix, offsets, metadata: _base_linear_sharded_state_dict(
-        prefix, OUT_FEATURES // rank.world.etp_size, DIM, rank
-    )
+    linear_in.weight = torch.nn.Parameter(torch.zeros(DIM // rank.world.etp_size, IN_FEATURES))
+    linear_out.weight = torch.nn.Parameter(torch.zeros(OUT_FEATURES // rank.world.etp_size, DIM))
+
+    def linear_in_sharded_state_dict(prefix, offsets, metadata):
+        state_dict = _base_linear_sharded_state_dict(prefix, DIM // rank.world.etp_size, IN_FEATURES, rank, offsets)
+        state_dict[f"{prefix}weight"].data = linear_in.weight
+        return state_dict
+
+    def linear_out_sharded_state_dict(prefix, offsets, metadata):
+        state_dict = _base_linear_sharded_state_dict(prefix, OUT_FEATURES // rank.world.etp_size, DIM, rank, offsets)
+        state_dict[f"{prefix}weight"].data = linear_out.weight
+        return state_dict
+
+    linear_in.sharded_state_dict.side_effect = linear_in_sharded_state_dict
+    linear_out.sharded_state_dict.side_effect = linear_out_sharded_state_dict
 
     config = ModelParallelConfig(
         tensor_model_parallel_size=rank.world.etp_size,
@@ -316,6 +333,92 @@ def test_legacy_schema_detection_fails_closed_on_missing_metadata() -> None:
         with patch("megatron.bridge.peft.utils.dist_checkpointing.load_tensors_metadata", return_value={}):
             with pytest.raises(RuntimeError, match="missing from checkpoint tensor metadata"):
                 _enable_legacy_shared_expert_adapter_loading(adapter, state_dict, "/checkpoint")
+
+
+def test_legacy_schema_detection_uses_parameter_identity_on_nonzero_pipeline_stage() -> None:
+    """A PP2 stage-local adapter is found after its checkpoint key is globally renumbered."""
+    rank = Rank(etp=0, ep=0, edp=0, world=World(etp_size=1, ep_size=2, edp_size=1))
+    adapter = _make_adapter(rank)
+    sharded_offsets = ((0, 44, 88),)
+    with (
+        patch.object(parallel_state, "get_expert_model_parallel_rank", return_value=rank.ep),
+        patch.object(parallel_state, "get_expert_model_parallel_world_size", return_value=rank.world.ep_size),
+        patch.object(parallel_state, "get_expert_tensor_parallel_rank", return_value=rank.etp),
+        patch.object(parallel_state, "get_expert_data_parallel_rank", return_value=rank.edp),
+    ):
+        state_dict = {"model": adapter.sharded_state_dict(prefix=PREFIX, sharded_offsets=sharded_offsets)}
+
+    checkpoint_metadata = {}
+    for factory in state_dict["model"].values():
+        if not isinstance(factory, ShardedTensorFactory):
+            continue
+        factory.key = factory.key.replace("decoder.layers.1", "decoder.layers.44")
+        shards = factory.build()
+        expected_shape = tuple(shards[0].global_shape)
+        expert_axis = len(expected_shape) - factory.data.ndim - 1
+        legacy_shape = expected_shape[:expert_axis] + expected_shape[expert_axis + 1 :]
+        checkpoint_metadata[factory.key] = Mock(global_shape=legacy_shape)
+
+    with patch(
+        "megatron.bridge.peft.utils.dist_checkpointing.load_tensors_metadata",
+        return_value=checkpoint_metadata,
+    ):
+        legacy_adapters = _enable_legacy_shared_expert_adapter_loading(adapter, state_dict, "/checkpoint")
+
+    assert legacy_adapters == (adapter,)
+    assert adapter._use_legacy_shared_expert_adapter_checkpoint
+
+
+def test_legacy_schema_detection_rejects_mixed_component_schemas() -> None:
+    """One adapter cannot regenerate one component in each checkpoint schema."""
+    rank = Rank(etp=0, ep=0, edp=0, world=World(etp_size=1, ep_size=2, edp_size=1))
+    adapter = _make_adapter(rank)
+    with (
+        patch.object(parallel_state, "get_expert_model_parallel_rank", return_value=rank.ep),
+        patch.object(parallel_state, "get_expert_model_parallel_world_size", return_value=rank.world.ep_size),
+        patch.object(parallel_state, "get_expert_tensor_parallel_rank", return_value=rank.etp),
+        patch.object(parallel_state, "get_expert_data_parallel_rank", return_value=rank.edp),
+    ):
+        state_dict = {"model": adapter.sharded_state_dict(prefix=PREFIX)}
+
+    checkpoint_metadata = {}
+    for factory in state_dict["model"].values():
+        if not isinstance(factory, ShardedTensorFactory):
+            continue
+        expected_shape = tuple(factory.build()[0].global_shape)
+        checkpoint_shape = expected_shape[1:] if factory.key.endswith("linear_in.weight") else expected_shape
+        checkpoint_metadata[factory.key] = Mock(global_shape=checkpoint_shape)
+
+    with patch(
+        "megatron.bridge.peft.utils.dist_checkpointing.load_tensors_metadata",
+        return_value=checkpoint_metadata,
+    ):
+        with pytest.raises(RuntimeError, match="mixes current and legacy checkpoint schemas"):
+            _enable_legacy_shared_expert_adapter_loading(adapter, state_dict, "/checkpoint")
+
+
+def test_legacy_schema_detection_rejects_missing_component_factory() -> None:
+    """Both LoRA matrices must have explicit checkpoint schema evidence."""
+    rank = Rank(etp=0, ep=0, edp=0, world=World(etp_size=1, ep_size=2, edp_size=1))
+    adapter = _make_adapter(rank)
+    with (
+        patch.object(parallel_state, "get_expert_model_parallel_rank", return_value=rank.ep),
+        patch.object(parallel_state, "get_expert_model_parallel_world_size", return_value=rank.world.ep_size),
+        patch.object(parallel_state, "get_expert_tensor_parallel_rank", return_value=rank.etp),
+        patch.object(parallel_state, "get_expert_data_parallel_rank", return_value=rank.edp),
+    ):
+        model_state = adapter.sharded_state_dict(prefix=PREFIX)
+    del model_state[f"{PREFIX}linear_out.weight"]
+
+    linear_in_factory = model_state[f"{PREFIX}linear_in.weight"]
+    expected_shape = tuple(linear_in_factory.build()[0].global_shape)
+    checkpoint_metadata = {linear_in_factory.key: Mock(global_shape=expected_shape[1:])}
+    with patch(
+        "megatron.bridge.peft.utils.dist_checkpointing.load_tensors_metadata",
+        return_value=checkpoint_metadata,
+    ):
+        with pytest.raises(RuntimeError, match="missing a checkpoint factory"):
+            _enable_legacy_shared_expert_adapter_loading(adapter, {"model": model_state}, "/checkpoint")
 
 
 def test_global_expert_axis_factory_preserves_etp_swiglu_values() -> None:
