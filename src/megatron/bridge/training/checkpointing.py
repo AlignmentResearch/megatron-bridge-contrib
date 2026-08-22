@@ -59,6 +59,13 @@ from modelopt.torch.opt.plugins import (
 )
 
 from megatron.bridge.peft.base import PEFT
+from megatron.bridge.peft.utils import (
+    EXPERT_ADAPTER_CHECKPOINT_SCHEMA,
+    LEGACY_EXPERT_ADAPTER_CHECKPOINT_SCHEMA,
+    ParallelLinearAdapter,
+    _disable_legacy_shared_expert_adapter_loading,
+    _enable_legacy_shared_expert_adapter_loading,
+)
 from megatron.bridge.training import fault_tolerance
 from megatron.bridge.training.callbacks import CallbackContext, CallbackManager, should_fire
 from megatron.bridge.training.config import CheckpointConfig, ConfigContainer
@@ -1972,17 +1979,52 @@ def _load_checkpoint_from_path(
             load_kwargs["sharded_state_dict"], cfg.peft
         )
 
+    legacy_expert_adapters = ()
+    if is_peft_resume and ckpt_format == "torch_dist":
+
+        def regenerate_peft_state_dict() -> dict[str, Any]:
+            regenerated_state_dict = generate_state_dict(
+                cfg.checkpoint,
+                model,
+                gen_sd_optim,
+                gen_sd_opt_param_scheduler,
+                gen_sd_rng_state,
+                optim_sd_kwargs=optim_sd_kwargs,
+                model_sd_kwargs=model_sd_kwargs,
+                rerun_state=gen_sd_rerun_state,
+                pg_collection=pg_collection,
+            )
+            return apply_peft_adapter_filter_to_state_dict(regenerated_state_dict, cfg.peft)
+
+        load_kwargs["sharded_state_dict"], legacy_expert_adapters = (
+            _prepare_legacy_shared_expert_adapter_checkpoint_load(
+                model=model,
+                sharded_state_dict=load_kwargs["sharded_state_dict"],
+                checkpoint_name=checkpoint_name,
+                regenerate_state_dict=regenerate_peft_state_dict,
+            )
+        )
+        if legacy_expert_adapters:
+            print_rank_0(
+                "Migrating grouped-expert adapter checkpoint schema "
+                f"{LEGACY_EXPERT_ADAPTER_CHECKPOINT_SCHEMA} as identical EP-local initialization; "
+                f"subsequent checkpoints use {EXPERT_ADAPTER_CHECKPOINT_SCHEMA}."
+            )
+
     # Load the checkpoint
-    state_dict, checkpoint_name, release, ckpt_type = _load_base_checkpoint(
-        load_dir,
-        cfg.checkpoint,
-        rank0=False,
-        checkpointing_context=checkpointing_context,
-        ignore_ckpt_step=ignore_ckpt_step,
-        cfg=cfg,
-        pg_collection=pg_collection,
-        **load_kwargs,
-    )
+    try:
+        state_dict, checkpoint_name, release, ckpt_type = _load_base_checkpoint(
+            load_dir,
+            cfg.checkpoint,
+            rank0=False,
+            checkpointing_context=checkpointing_context,
+            ignore_ckpt_step=ignore_ckpt_step,
+            cfg=cfg,
+            pg_collection=pg_collection,
+            **load_kwargs,
+        )
+    finally:
+        _disable_legacy_shared_expert_adapter_loading(legacy_expert_adapters)
 
     # Checkpoint not loaded
     if state_dict is None:
@@ -2230,6 +2272,25 @@ def init_checkpointing_context(checkpoint_config: CheckpointConfig) -> dict[str,
         )
     }
     return checkpointing_context
+
+
+def _prepare_legacy_shared_expert_adapter_checkpoint_load(
+    *,
+    model: list[MegatronModule],
+    sharded_state_dict: dict[str, Any],
+    checkpoint_name: str,
+    regenerate_state_dict: Callable[[], dict[str, Any]],
+) -> tuple[dict[str, Any], tuple[ParallelLinearAdapter, ...]]:
+    """Rebuild a PEFT load state dict when checkpoint metadata uses legacy 2D adapters."""
+
+    legacy_adapters = _enable_legacy_shared_expert_adapter_loading(model, sharded_state_dict, checkpoint_name)
+    if not legacy_adapters:
+        return sharded_state_dict, ()
+    try:
+        return regenerate_state_dict(), legacy_adapters
+    except Exception:
+        _disable_legacy_shared_expert_adapter_loading(legacy_adapters)
+        raise
 
 
 def apply_peft_adapter_filter_to_state_dict(state_dict: dict[str, Any], peft_config: PEFT) -> dict[str, Any]:

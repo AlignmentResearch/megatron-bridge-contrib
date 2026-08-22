@@ -14,15 +14,17 @@
 
 import math
 import re
+from collections.abc import Iterator, Mapping
 from dataclasses import dataclass
 from importlib.metadata import version
-from typing import Callable, Dict, Optional, Tuple
+from pathlib import Path
+from typing import Callable, Dict, Final, Optional, Tuple
 
 import packaging
 import torch
 import torch.nn as nn
-from megatron.core import ModelParallelConfig, parallel_state
-from megatron.core.dist_checkpointing.mapping import ShardedStateDict, ShardedTensor
+from megatron.core import ModelParallelConfig, dist_checkpointing, parallel_state
+from megatron.core.dist_checkpointing.mapping import ShardedStateDict, ShardedTensor, ShardedTensorFactory
 from megatron.core.tensor_parallel import ColumnParallelLinear, RowParallelLinear
 from megatron.core.tensor_parallel.mappings import (
     copy_to_tensor_model_parallel_region,
@@ -68,6 +70,9 @@ MixedFusedLayerNorm, HAVE_APEX = safe_import_from("apex.normalization.fused_laye
 
 TECL = (TEColumnParallelLinear, TELayerNormColumnParallelLinear, TEColumnParallelGroupedLinear)
 TERL = (TERowParallelLinear, TERowParallelGroupedLinear)
+
+LEGACY_EXPERT_ADAPTER_CHECKPOINT_SCHEMA: Final = "legacy_shared_2d"
+EXPERT_ADAPTER_CHECKPOINT_SCHEMA: Final = "global_expert_axis_v1"
 
 
 @dataclass(frozen=True)
@@ -205,6 +210,148 @@ def is_expert_linear(fqn: str) -> bool:
         False
     """
     return re.match(r".*mlp\..*experts.*\.linear_fc[1-2]$", fqn) is not None and not ".shared_experts." in fqn
+
+
+def _iter_sharded_tensor_factories(state_dict: object) -> Iterator[ShardedTensorFactory]:
+    """Yield tensor factories from a nested sharded state dict."""
+
+    if isinstance(state_dict, ShardedTensorFactory):
+        yield state_dict
+    elif isinstance(state_dict, Mapping):
+        for value in state_dict.values():
+            yield from _iter_sharded_tensor_factories(value)
+    elif isinstance(state_dict, (list, tuple)):
+        for value in state_dict:
+            yield from _iter_sharded_tensor_factories(value)
+
+
+def _checkpoint_tensor_shape(checkpoint_metadata: Mapping[str, ShardedTensor], key: str) -> tuple[int, ...] | None:
+    """Return a checkpoint tensor's global shape, tolerating model section prefixes."""
+
+    for candidate in (key, f"model.{key}"):
+        metadata = checkpoint_metadata.get(candidate)
+        if metadata is not None:
+            return tuple(metadata.global_shape)
+    return None
+
+
+def _shared_expert_adapter_factory_info(
+    factory: ShardedTensorFactory,
+) -> tuple[str, tuple[int, ...]] | None:
+    """Return the adapter key and new-schema shape represented by a factory."""
+
+    for suffix in (".linear_in.weight", ".linear_out.weight"):
+        if not factory.key.endswith(suffix):
+            continue
+        built = factory.build()
+        shards = built if isinstance(built, list) else [built]
+        if not shards or not isinstance(shards[0], ShardedTensor):
+            return None
+        expected_shape = tuple(shards[0].global_shape)
+        if len(expected_shape) == factory.data.ndim + 1:
+            return factory.key[: -len(suffix)], expected_shape
+    return None
+
+
+def _matching_shared_expert_adapters(
+    adapters_by_name: list[tuple[str, "ParallelLinearAdapter"]], adapter_key: str
+) -> list["ParallelLinearAdapter"]:
+    """Return model adapter candidates for a checkpoint adapter key."""
+
+    exact_matches = [adapter for name, adapter in adapters_by_name if name == adapter_key]
+    if exact_matches:
+        return exact_matches
+
+    adapter_base_key = adapter_key.removesuffix(".adapter")
+    matches = []
+    for module_name, module in adapters_by_name:
+        module_base_key = module_name.removesuffix(".adapter")
+        base_linear_name = module.base_linear_name
+        if (
+            adapter_key.endswith(module_name)
+            or module_name.endswith(adapter_key)
+            or adapter_base_key.endswith(module_base_key)
+            or module_base_key.endswith(adapter_base_key)
+            or adapter_base_key.endswith(base_linear_name)
+            or base_linear_name.endswith(adapter_base_key)
+        ):
+            matches.append(module)
+    return matches
+
+
+def _enable_legacy_shared_expert_adapter_loading(
+    megatron_model: list[nn.Module] | nn.Module,
+    sharded_state_dict: ShardedStateDict,
+    checkpoint_path: str | Path,
+) -> tuple["ParallelLinearAdapter", ...]:
+    """Select legacy 2D loading for grouped-expert adapters in an old checkpoint.
+
+    The old schema stored one shared 2D adapter tensor and encoded EP ranks as
+    replicas. The current schema adds a leading global-expert axis. This function
+    inspects checkpoint metadata and temporarily marks only adapters whose saved
+    shape is the old 2D form. Call :func:`_disable_legacy_shared_expert_adapter_loading`
+    after loading so subsequent saves use the current schema.
+
+    Args:
+        megatron_model: Model module or pipeline model chunks containing adapters.
+        sharded_state_dict: Current-schema state dict for the checkpoint load.
+        checkpoint_path: Distributed checkpoint directory whose metadata is inspected.
+
+    Returns:
+        Adapters temporarily marked to emit legacy 2D sharding.
+    """
+
+    checkpoint_metadata = dist_checkpointing.load_tensors_metadata(str(checkpoint_path))
+    models = megatron_model if isinstance(megatron_model, list) else [megatron_model]
+    adapters_by_name = [
+        (name.removeprefix("module."), module)
+        for model in models
+        for name, module in model.named_modules()
+        if isinstance(module, ParallelLinearAdapter) and module._uses_grouped_expert_sharding()
+    ]
+
+    legacy_adapters: set[ParallelLinearAdapter] = set()
+    for factory in _iter_sharded_tensor_factories(sharded_state_dict):
+        factory_info = _shared_expert_adapter_factory_info(factory)
+        if factory_info is None:
+            continue
+        adapter_key, expected_shape = factory_info
+        checkpoint_shape = _checkpoint_tensor_shape(checkpoint_metadata, factory.key)
+        if checkpoint_shape is None:
+            raise RuntimeError(
+                f"Grouped-expert adapter {factory.key} is missing from checkpoint tensor metadata; "
+                "refusing to guess its checkpoint schema"
+            )
+        if checkpoint_shape == expected_shape:
+            continue
+        if checkpoint_shape != expected_shape[1:]:
+            raise RuntimeError(
+                f"Unsupported grouped-expert adapter checkpoint shape for {factory.key}: "
+                f"checkpoint={checkpoint_shape}, expected current={expected_shape} or legacy={expected_shape[1:]}"
+            )
+
+        matches = _matching_shared_expert_adapters(adapters_by_name, adapter_key)
+        if len(matches) != 1:
+            raise RuntimeError(
+                f"Legacy grouped-expert adapter key {adapter_key!r} matched {len(matches)} model adapters; "
+                "refusing an ambiguous checkpoint migration"
+            )
+        legacy_adapters.add(matches[0])
+
+    for adapter in legacy_adapters:
+        adapter._use_legacy_shared_expert_adapter_checkpoint = True
+    return tuple(legacy_adapters)
+
+
+def _disable_legacy_shared_expert_adapter_loading(adapters: tuple["ParallelLinearAdapter", ...]) -> None:
+    """Clear the temporary legacy-schema flag after loading.
+
+    Args:
+        adapters: Adapters returned by :func:`_enable_legacy_shared_expert_adapter_loading`.
+    """
+
+    for adapter in adapters:
+        adapter._use_legacy_shared_expert_adapter_checkpoint = False
 
 
 def wildcard_match(pattern: str, key: Optional[str]) -> Optional[bool]:
@@ -465,6 +612,7 @@ class ParallelLinearAdapter(nn.Module):
         self.dropout_position = dropout_position
         self.use_a2a = a2a_experimental
         self.is_expert = is_expert
+        self._use_legacy_shared_expert_adapter_checkpoint = False
 
         # megatron_gpt_peft_models will provide this arg, but deprecated ones do not.
         # in case this arg is not provided, use the dummy default config.
@@ -740,6 +888,199 @@ class ParallelLinearAdapter(nn.Module):
 
         return x
 
+    def _uses_grouped_expert_sharding(self) -> bool:
+        """Return whether this adapter spans a rank's grouped local experts."""
+
+        return self.is_expert and ".local_experts." not in self.base_linear_name
+
+    def local_experts_per_rank(self) -> int:
+        """Return the number of global expert slots owned by this EP rank."""
+
+        ep_size = parallel_state.get_expert_model_parallel_world_size()
+        num_global_experts = getattr(self.config, "num_moe_experts", None)
+        if num_global_experts is None:
+            raise ValueError(
+                f"num_moe_experts is required to checkpoint grouped expert adapter {self.base_linear_name}"
+            )
+        if int(num_global_experts) % ep_size != 0:
+            raise ValueError(
+                f"num_moe_experts={num_global_experts} must be divisible by expert_model_parallel_size={ep_size}"
+            )
+        return int(num_global_experts) // ep_size
+
+    def _expert_axis_info(self, sharded_offsets: Tuple) -> tuple[int, int, int]:
+        """Return the global expert-axis sharding metadata for this rank."""
+
+        ep_rank = parallel_state.get_expert_model_parallel_rank()
+        local_experts = self.local_experts_per_rank()
+        num_global_experts = int(self.config.num_moe_experts)
+        first_expert_slot = ep_rank * local_experts
+        if first_expert_slot >= num_global_experts:
+            raise ValueError(
+                f"Invalid expert adapter sharding for {self.base_linear_name}: ep_rank={ep_rank}, "
+                f"local_experts_per_rank={local_experts}, num_moe_experts={num_global_experts}"
+            )
+        return len(sharded_offsets), first_expert_slot, num_global_experts
+
+    def _keep_expert_extra_state(self) -> bool:
+        """Return whether this rank contributes unsharded adapter extra state."""
+
+        return (
+            parallel_state.get_expert_tensor_parallel_rank() == 0
+            and parallel_state.get_expert_model_parallel_rank() == 0
+        )
+
+    def _set_expert_replica_ids(self, *state_dicts: ShardedStateDict) -> None:
+        """Mark expert adapter replicas only across expert data-parallel ranks."""
+
+        edp_rank = parallel_state.get_expert_data_parallel_rank()
+        for state_dict in state_dicts:
+            for value in state_dict.values():
+                if not hasattr(value, "replica_id"):
+                    continue
+                replica_id = value.replica_id
+                if isinstance(replica_id, int):
+                    replica_id = (0, 0, replica_id)
+                if len(replica_id) != 3:
+                    raise ValueError(
+                        f"Expected replica_id for {self.base_linear_name} in (PP, TP, DP) format, got {replica_id}"
+                    )
+                dp_replica_id = 0 if getattr(value, "is_data_parallel_fully_shard", False) else edp_rank
+                value.replica_id = (*replica_id[:2], dp_replica_id)
+
+    def _set_legacy_expert_replica_ids(self, *state_dicts: ShardedStateDict) -> None:
+        """Reproduce the old EP-as-replica identity while loading a 2D checkpoint."""
+
+        ep_rank = parallel_state.get_expert_model_parallel_rank()
+        etp_size = parallel_state.get_expert_tensor_parallel_world_size()
+        for state_dict in state_dicts:
+            for value in state_dict.values():
+                if not hasattr(value, "replica_id"):
+                    continue
+                replica_id = value.replica_id
+                if isinstance(replica_id, int) or len(replica_id) != 3:
+                    raise ValueError(
+                        f"Expected legacy replica_id for {self.base_linear_name} in (PP, TP, DP) format, "
+                        f"got {replica_id}"
+                    )
+                value.replica_id = (replica_id[0], ep_rank * etp_size + replica_id[1], replica_id[2])
+
+    def _apply_expert_axis_factory(
+        self,
+        sharded_tensor: ShardedTensor,
+        sharded_offsets: Tuple,
+        *,
+        split_swiglu: bool = False,
+    ) -> ShardedTensorFactory:
+        """Map one EP-local adapter tensor to the global expert slots it serves."""
+
+        expert_axis, first_expert_slot, num_global_experts = self._expert_axis_info(sharded_offsets)
+        local_experts = self.local_experts_per_rank()
+        base_prepend_axis_num = len(sharded_offsets)
+        output_prepend_axis_num = base_prepend_axis_num + 1
+        swiglu_shard_axis = 0
+
+        preserved_rank_offsets = []
+        for axis, local_axis_shape in enumerate(sharded_tensor.local_shape):
+            base_global_axis = axis + base_prepend_axis_num
+            output_global_axis = base_global_axis + 1
+            axis_fragments = sharded_tensor.axis_fragmentations[base_global_axis]
+            if axis_fragments <= 1:
+                continue
+            global_offset = sharded_tensor.global_offset[base_global_axis]
+            if global_offset % local_axis_shape != 0:
+                raise ValueError(
+                    f"Cannot preserve non-integral sharding for {sharded_tensor.key}: "
+                    f"offset={global_offset}, local_axis_shape={local_axis_shape}"
+                )
+            preserved_rank_offsets.append((output_global_axis, global_offset // local_axis_shape, axis_fragments))
+
+        base_swiglu_global_axis = swiglu_shard_axis + base_prepend_axis_num
+        output_swiglu_global_axis = swiglu_shard_axis + output_prepend_axis_num
+        swiglu_axis_frag = None
+        swiglu_rank_offset = None
+        if split_swiglu:
+            local_axis_size = sharded_tensor.local_shape[swiglu_shard_axis]
+            global_offset = sharded_tensor.global_offset[base_swiglu_global_axis]
+            if global_offset % local_axis_size != 0:
+                raise ValueError(
+                    f"Cannot split SwiGLU tensor {sharded_tensor.key}: "
+                    f"offset={global_offset}, local_axis_shape={local_axis_size}"
+                )
+            swiglu_rank_offset = global_offset // local_axis_size
+            swiglu_axis_frag = sharded_tensor.axis_fragmentations[base_swiglu_global_axis]
+            preserved_rank_offsets = [
+                rank_offset for rank_offset in preserved_rank_offsets if rank_offset[0] != output_swiglu_global_axis
+            ]
+
+        @torch.no_grad()
+        def build_fn(key: str, tensor: torch.Tensor, replica_id, flattened_range):
+            if flattened_range is not None:
+                raise ValueError(f"Flattened grouped-expert adapter tensors are unsupported for {key}")
+            shards = []
+            swiglu_parts = torch.chunk(tensor, 2, dim=swiglu_shard_axis) if split_swiglu else ()
+            for expert_index in range(local_experts):
+                expert_offset = (expert_axis, first_expert_slot + expert_index, num_global_experts)
+                if not split_swiglu:
+                    shards.append(
+                        ShardedTensor.from_rank_offsets(
+                            key,
+                            tensor,
+                            *sharded_offsets,
+                            *preserved_rank_offsets,
+                            expert_offset,
+                            replica_id=replica_id,
+                            prepend_axis_num=output_prepend_axis_num,
+                        )
+                    )
+                    continue
+
+                offset_w = (output_swiglu_global_axis, swiglu_rank_offset, swiglu_axis_frag * 2)
+                offset_v = (
+                    output_swiglu_global_axis,
+                    swiglu_rank_offset + swiglu_axis_frag,
+                    swiglu_axis_frag * 2,
+                )
+                for tensor_part, swiglu_offset in zip(swiglu_parts, (offset_w, offset_v)):
+                    shards.append(
+                        ShardedTensor.from_rank_offsets(
+                            key,
+                            tensor_part,
+                            *sharded_offsets,
+                            *preserved_rank_offsets,
+                            expert_offset,
+                            swiglu_offset,
+                            replica_id=replica_id,
+                            prepend_axis_num=output_prepend_axis_num,
+                        )
+                    )
+            return shards
+
+        def merge_fn(loaded_shards):
+            shards = loaded_shards if isinstance(loaded_shards, list) else [loaded_shards]
+            if split_swiglu:
+                if len(shards) % 2 != 0:
+                    raise ValueError(f"Expected paired SwiGLU shards for {sharded_tensor.key}")
+                shards = [
+                    torch.cat(shards[index : index + 2], dim=swiglu_shard_axis) for index in range(0, len(shards), 2)
+                ]
+            reference = shards[0]
+            if any(not torch.equal(shard, reference) for shard in shards[1:]):
+                raise RuntimeError(
+                    f"Cannot merge distinct global expert slots into shared adapter {sharded_tensor.key}; "
+                    "load with the checkpoint's EP degree; one rank-local adapter cannot represent unequal slots"
+                )
+            return reference
+
+        return ShardedTensorFactory(
+            sharded_tensor.key,
+            sharded_tensor.data,
+            build_fn,
+            merge_fn,
+            sharded_tensor.replica_id,
+            flattened_range=sharded_tensor.flattened_range,
+        )
+
     def sharded_state_dict(
         self,
         prefix: str = "",
@@ -761,42 +1102,32 @@ class ParallelLinearAdapter(nn.Module):
             Sharded state dictionary for distributed checkpointing.
         """
         sharded_state_dict = {}
+        use_expert_axis = (
+            self._uses_grouped_expert_sharding() and not self._use_legacy_shared_expert_adapter_checkpoint
+        )
+        is_linear_fc1 = "linear_fc1" in self.base_linear_name
+        split_swiglu = is_linear_fc1 and getattr(self.config, "gated_linear_unit", False)
         linear_in_sd = self.linear_in.sharded_state_dict(f"{prefix}linear_in.", sharded_offsets, metadata)
         linear_out_sd = self.linear_out.sharded_state_dict(f"{prefix}linear_out.", sharded_offsets, metadata)
 
-        # Megatron's grouped expert linear (TEGroupedLinear._sharded_state_dict_grouped) leaves EP
-        # out of replica_id entirely: its keys carry the global expert index, so two EP ranks never
-        # describe the same shard. An adapter key has no expert index -- one ParallelLinearAdapter
-        # spans a rank's whole local expert group -- so without help every EP rank claims the main
-        # replica of one key. That is what this block is for.
-        #
-        # Where EP goes is constrained from two sides:
-        #
-        # - It cannot displace slot 1. For the `_extra_state` ShardedObjects slot 1 holds the
-        #   expert-TP rank, and a ShardedObject carries no offsets to tell ETP ranks apart, so
-        #   overwriting it makes every ETP rank a main replica of the same key. Dist-checkpointing
-        #   rejects that outright -- the save raises and the run dies instead of checkpointing.
-        # - It cannot live in slot 2 either. The distributed optimizer derives its own shardings
-        #   from these, keeping replica_id[:2] and overwriting the last slot with its instance id
-        #   (distrib_optimizer.py, "Set DP corresponding replica_id coordinate to 0"), which would
-        #   erase an EP identity parked there and collide the optimizer state instead.
-        #
-        # So EP and expert-TP share slot 1, flattened. Slot 1 is already the coordinate that
-        # separates ranks holding different pieces of the same key, and at EP=1 the expression
-        # collapses to exactly the expert-TP rank megatron put there. Slot 2 keeps megatron's own
-        # data-parallel replica id untouched.
-        if self.is_expert:
-            from megatron.core import parallel_state
+        if use_expert_axis:
+            if not self._keep_expert_extra_state():
+                for state_dict in (linear_in_sd, linear_out_sd):
+                    for key in list(state_dict):
+                        if "_extra_state" in key:
+                            del state_dict[key]
+            for key, value in list(linear_in_sd.items()):
+                if isinstance(value, ShardedTensor):
+                    linear_in_sd[key] = self._apply_expert_axis_factory(value, sharded_offsets)
+            for key, value in list(linear_out_sd.items()):
+                if isinstance(value, ShardedTensor):
+                    linear_out_sd[key] = self._apply_expert_axis_factory(
+                        value, sharded_offsets, split_swiglu=split_swiglu
+                    )
+        elif self.is_expert:
+            self._set_legacy_expert_replica_ids(linear_in_sd, linear_out_sd)
 
-            ep_rank = parallel_state.get_expert_model_parallel_rank()
-            etp_size = parallel_state.get_expert_tensor_parallel_world_size()
-            for sd in [linear_in_sd, linear_out_sd]:
-                for v in sd.values():
-                    if hasattr(v, "replica_id"):
-                        old_rid = v.replica_id
-                        v.replica_id = (old_rid[0], ep_rank * etp_size + old_rid[1], old_rid[2])
-
-        if "linear_fc1" in self.base_linear_name:
+        if is_linear_fc1 and not use_expert_axis:
             for k, v in linear_out_sd.items():
                 if k in (f"{prefix}linear_out.weight", f"{prefix}linear_out.bias"):
                     linear_out_sd[k] = apply_swiglu_sharded_factory(v, sharded_offsets)
@@ -829,6 +1160,9 @@ class ParallelLinearAdapter(nn.Module):
                             ["z", "x", "B", "C", "dt"],
                             0,  # split along dimension 0
                         )
+
+        if use_expert_axis:
+            self._set_expert_replica_ids(linear_in_sd, linear_out_sd)
 
         sharded_state_dict.update(linear_in_sd)
         sharded_state_dict.update(linear_out_sd)
