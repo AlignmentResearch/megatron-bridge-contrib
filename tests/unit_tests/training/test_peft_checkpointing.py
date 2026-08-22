@@ -30,6 +30,7 @@ from megatron.bridge.models.gpt_provider import GPTModelProvider
 from megatron.bridge.peft.base import PEFT
 from megatron.bridge.peft.lora import LoRA
 from megatron.bridge.training.checkpointing import (
+    CheckpointType,
     _is_model_section,
     _prepare_legacy_shared_expert_adapter_checkpoint_load,
     apply_peft_adapter_filter_to_state_dict,
@@ -114,6 +115,7 @@ class TestPrepareLegacySharedExpertAdapterCheckpointLoad:
             model=[Mock()],
             sharded_state_dict=state_dict,
             checkpoint_name="/checkpoint",
+            checkpoint_type=CheckpointType.GLOBAL,
             regenerate_state_dict=regenerate_state_dict,
         )
 
@@ -133,6 +135,7 @@ class TestPrepareLegacySharedExpertAdapterCheckpointLoad:
             model=[Mock()],
             sharded_state_dict=state_dict,
             checkpoint_name="/checkpoint",
+            checkpoint_type=CheckpointType.GLOBAL,
             regenerate_state_dict=regenerate_state_dict,
         )
 
@@ -152,10 +155,29 @@ class TestPrepareLegacySharedExpertAdapterCheckpointLoad:
                 model=[Mock()],
                 sharded_state_dict={"model": {}},
                 checkpoint_name="/checkpoint",
+                checkpoint_type=CheckpointType.GLOBAL,
                 regenerate_state_dict=regenerate_state_dict,
             )
 
         disable_legacy_loading.assert_called_once_with((adapter,))
+
+    @patch("megatron.bridge.training.checkpointing._enable_legacy_shared_expert_adapter_loading")
+    def test_local_checkpoint_skips_global_metadata_migration(self, enable_legacy_loading):
+        state_dict = {"model": {"adapter": object()}}
+        regenerate_state_dict = Mock()
+
+        prepared, adapters = _prepare_legacy_shared_expert_adapter_checkpoint_load(
+            model=[Mock()],
+            sharded_state_dict=state_dict,
+            checkpoint_name=object(),
+            checkpoint_type=CheckpointType.LOCAL,
+            regenerate_state_dict=regenerate_state_dict,
+        )
+
+        assert prepared is state_dict
+        assert adapters == ()
+        enable_legacy_loading.assert_not_called()
+        regenerate_state_dict.assert_not_called()
 
 
 class TestApplyPeftAdapterFilterToStateDict:

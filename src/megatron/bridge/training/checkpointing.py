@@ -2001,6 +2001,7 @@ def _load_checkpoint_from_path(
                 model=model,
                 sharded_state_dict=load_kwargs["sharded_state_dict"],
                 checkpoint_name=checkpoint_name,
+                checkpoint_type=ckpt_type,
                 regenerate_state_dict=regenerate_peft_state_dict,
             )
         )
@@ -2278,11 +2279,16 @@ def _prepare_legacy_shared_expert_adapter_checkpoint_load(
     *,
     model: list[MegatronModule],
     sharded_state_dict: dict[str, Any],
-    checkpoint_name: str,
+    checkpoint_name: object,
+    checkpoint_type: CheckpointType,
     regenerate_state_dict: Callable[[], dict[str, Any]],
 ) -> tuple[dict[str, Any], tuple[ParallelLinearAdapter, ...]]:
     """Rebuild a PEFT load state dict when checkpoint metadata uses legacy 2D adapters."""
 
+    if checkpoint_type is not CheckpointType.GLOBAL:
+        return sharded_state_dict, ()
+    if not isinstance(checkpoint_name, (str, os.PathLike)):
+        raise TypeError(f"Global checkpoint name must be path-like, got {type(checkpoint_name).__name__}")
     legacy_adapters = _enable_legacy_shared_expert_adapter_loading(model, sharded_state_dict, checkpoint_name)
     if not legacy_adapters:
         return sharded_state_dict, ()
