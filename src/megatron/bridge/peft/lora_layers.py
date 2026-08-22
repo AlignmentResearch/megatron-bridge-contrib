@@ -39,6 +39,52 @@ class LoRALinear(AdapterWrapper):
     class to provide a specific implementation of the forward method.
     """
 
+    def __init__(self, to_wrap: nn.Module, adapter: nn.Module) -> None:
+        super().__init__(to_wrap, adapter)
+        self._fused_expert_lora_enabled = False
+        self._fused_expert_lora_counters = {
+            "forward_calls": 0,
+            "backward_calls": 0,
+            "base_only_forward_calls": 0,
+        }
+
+    def enable_fused_expert_lora(self, *, expected_rank: int, expected_alpha: float) -> dict[str, Any]:
+        """Enable the frozen grouped-base LoRA fusion after strict validation."""
+        fused_forward = getattr(self.to_wrap, "torch_grouped_mm_fused_lora_forward", None)
+        prepare = getattr(self.to_wrap, "prepare_torch_grouped_mm_fused_lora", None)
+        if fused_forward is None or prepare is None:
+            raise RuntimeError("fused expert LoRA requires a grouped linear with torch fusion support")
+        if type(self.adapter.activation) is not nn.Identity:
+            raise RuntimeError("fused expert LoRA requires identity adapter activation")
+        if type(self.adapter.dropout) is not nn.Identity:
+            raise RuntimeError("fused expert LoRA requires zero adapter dropout")
+        if int(self.adapter.config.expert_tensor_parallel_size) != 1:
+            raise RuntimeError("fused expert LoRA requires expert tensor parallel size 1")
+        if int(self.adapter.dim) != expected_rank:
+            raise RuntimeError(f"fused expert LoRA requires rank {expected_rank}, got {self.adapter.dim}")
+        if float(self.adapter.alpha) != expected_alpha:
+            raise RuntimeError(f"fused expert LoRA requires alpha {expected_alpha}, got {self.adapter.alpha}")
+
+        lora_a = self.adapter.linear_in.weight
+        lora_b = self.adapter.linear_out.weight
+        if not lora_a.requires_grad or not lora_b.requires_grad:
+            raise RuntimeError("fused expert LoRA requires trainable LoRA-A and LoRA-B")
+        if lora_a.dtype != torch.bfloat16 or lora_b.dtype != torch.bfloat16:
+            raise RuntimeError("fused expert LoRA requires BF16 adapter weights")
+
+        storage_witness = prepare(lora_a)
+        self._fused_expert_lora_enabled = True
+        return {
+            "rank": int(self.adapter.dim),
+            "alpha": float(self.adapter.alpha),
+            "scale": float(self.adapter.alpha / self.adapter.dim),
+            "input_features": int(lora_a.shape[1]),
+            "output_features": int(lora_b.shape[0]),
+            "relocated_storage_bytes": int(storage_witness["resident_storage_bytes"]),
+            "storage": storage_witness,
+            "counters": self._fused_expert_lora_counters,
+        }
+
     def forward(self, x: torch.Tensor, *args: Any, **kwargs: Any) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """Forward pass that combines the wrapped module output with the adapter output.
 
@@ -54,6 +100,18 @@ class LoRALinear(AdapterWrapper):
                 - Bias term (if present, otherwise None)
         """
         # pylint: disable=C0115,C0116
+        if self._fused_expert_lora_enabled:
+            if len(args) != 1 or kwargs:
+                raise RuntimeError("fused expert LoRA requires exactly one expert-split argument")
+            return self.to_wrap.torch_grouped_mm_fused_lora_forward(
+                x,
+                args[0],
+                lora_a=self.adapter.linear_in.weight,
+                lora_b=self.adapter.linear_out.weight,
+                scale=float(self.adapter.alpha / self.adapter.dim),
+                adapter_enabled=self._adapter_enabled,
+                counters=self._fused_expert_lora_counters,
+            )
         linear_output, bias, layernorm_output = self.base_linear_forward(x, *args, **kwargs)
         if not self._adapter_enabled:
             return linear_output, bias

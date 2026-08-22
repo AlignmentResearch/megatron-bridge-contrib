@@ -68,6 +68,57 @@ class MockParallelLinearAdapter(nn.Module):
         return self.linear(x) * 0.1  # Scale down to simulate adapter
 
 
+class MockFusedGroupedLinear(nn.Module):
+    """Minimal grouped base exposing the production fusion interface."""
+
+    def prepare_torch_grouped_mm_fused_lora(self, lora_a):
+        self.prepared_lora_a = lora_a
+        return {
+            "base_storage_bytes": 3072,
+            "augmentation_storage_bytes": 1024,
+            "resident_storage_bytes": 4096,
+            "duplicate_base_buffer_present": False,
+            "base_parameters_share_augmented_storage": True,
+            "cuda_memory_allocated_before": 0,
+            "cuda_memory_allocated_after": 0,
+            "cuda_memory_allocated_delta": 0,
+            "cuda_peak_allocated_before": 0,
+            "cuda_peak_allocated_after": 0,
+        }
+
+    def torch_grouped_mm_fused_lora_forward(
+        self,
+        x,
+        splits,
+        *,
+        lora_a,
+        lora_b,
+        scale,
+        adapter_enabled,
+        counters,
+    ):
+        assert sum(splits) == x.shape[0]
+        if adapter_enabled:
+            counters["forward_calls"] += 1
+            return x + scale * (x @ lora_a.T) @ lora_b.T, None
+        counters["base_only_forward_calls"] += 1
+        return x, None
+
+
+class MockFusedExpertAdapter(nn.Module):
+    """Rank-32 BF16 expert adapter accepted by the production gate."""
+
+    def __init__(self):
+        super().__init__()
+        self.activation = nn.Identity()
+        self.dropout = nn.Identity()
+        self.config = SimpleNamespace(expert_tensor_parallel_size=1)
+        self.dim = 32
+        self.alpha = 64
+        self.linear_in = nn.Linear(4, 32, bias=False, dtype=torch.bfloat16)
+        self.linear_out = nn.Linear(32, 4, bias=False, dtype=torch.bfloat16)
+
+
 class TestLoRALinear:
     """Test the LoRALinear adapter wrapper."""
 
@@ -116,6 +167,32 @@ class TestLoRALinear:
         # Verify addition
         expected = base_output + adapter_output
         assert torch.allclose(lora_output, expected, atol=1e-6)
+
+    def test_fused_expert_lora_uses_native_wrapper_without_changing_state(self):
+        base = MockFusedGroupedLinear()
+        adapter = MockFusedExpertAdapter()
+        wrapped = LoRALinear(base, adapter)
+        parameter_names = tuple(name for name, _ in wrapped.named_parameters())
+        parameter_ids = tuple(id(value) for value in wrapped.parameters())
+        state_keys = tuple(wrapped.state_dict())
+
+        runtime = wrapped.enable_fused_expert_lora(expected_rank=32, expected_alpha=64)
+        x = torch.randn(3, 4, dtype=torch.bfloat16)
+        enabled_output, _ = wrapped(x, [1, 0, 2])
+        wrapped.disable_adapter_layers()
+        disabled_output, _ = wrapped(x, [1, 0, 2])
+
+        assert runtime["relocated_storage_bytes"] == 4096
+        assert runtime["counters"] == {
+            "forward_calls": 1,
+            "backward_calls": 0,
+            "base_only_forward_calls": 1,
+        }
+        assert not torch.equal(enabled_output, disabled_output)
+        torch.testing.assert_close(disabled_output, x)
+        assert tuple(name for name, _ in wrapped.named_parameters()) == parameter_names
+        assert tuple(id(value) for value in wrapped.parameters()) == parameter_ids
+        assert tuple(wrapped.state_dict()) == state_keys
 
 
 class TestLinearAdapter:
