@@ -62,7 +62,7 @@ def _make_adapter() -> ParallelLinearAdapter:
     )
     config.num_moe_experts = NUM_EXPERTS
     config.gated_linear_unit = True
-    return ParallelLinearAdapter(
+    adapter = ParallelLinearAdapter(
         in_features=8,
         out_features=8,
         dim=4,
@@ -72,6 +72,9 @@ def _make_adapter() -> ParallelLinearAdapter:
         is_expert=True,
         model_parallel_config=config,
     )
+    if torch.cuda.is_available():
+        adapter = adapter.to(torch.device("cuda", int(os.environ["LOCAL_RANK"])))
+    return adapter
 
 
 def _metadata() -> dict:
@@ -115,7 +118,12 @@ def ep_topology():
     if int(os.environ.get("WORLD_SIZE", "1")) != EP_SIZE:
         pytest.skip("requires a four-rank torchrun launch")
 
-    dist.init_process_group("gloo")
+    if torch.cuda.is_available():
+        torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
+        backend = "nccl"
+    else:
+        backend = "gloo"
+    dist.init_process_group(backend)
     parallel_state.initialize_model_parallel(
         tensor_model_parallel_size=1,
         pipeline_model_parallel_size=1,
@@ -159,17 +167,20 @@ def test_distinct_ep_values_roundtrip_through_global_expert_axis(shared_checkpoi
 
 
 def test_legacy_2d_loads_identically_then_future_save_uses_global_axis(shared_checkpoint_dir: Path) -> None:
-    source = _make_adapter()
-    _set_weights(source, linear_in=3.0, linear_out=7.0)
-    source._use_legacy_shared_expert_adapter_checkpoint = True
-    _fully_parallel_save(_sharded_state(source), shared_checkpoint_dir)
+    external_checkpoint_dir = os.environ.get("LEGACY_EXPERT_ADAPTER_CHECKPOINT_DIR")
+    legacy_checkpoint_dir = Path(external_checkpoint_dir) if external_checkpoint_dir else shared_checkpoint_dir
+    if external_checkpoint_dir is None:
+        source = _make_adapter()
+        _set_weights(source, linear_in=3.0, linear_out=7.0)
+        source._use_legacy_shared_expert_adapter_checkpoint = True
+        _fully_parallel_save(_sharded_state(source), legacy_checkpoint_dir)
 
     fresh = _make_adapter()
     current_state = _sharded_state(fresh)
-    legacy_adapters = _enable_legacy_shared_expert_adapter_loading(fresh, current_state, shared_checkpoint_dir)
+    legacy_adapters = _enable_legacy_shared_expert_adapter_loading(fresh, current_state, legacy_checkpoint_dir)
     assert legacy_adapters == (fresh,)
     try:
-        loaded = _fully_parallel_load(_sharded_state(fresh), shared_checkpoint_dir)
+        loaded = _fully_parallel_load(_sharded_state(fresh), legacy_checkpoint_dir)
     finally:
         _disable_legacy_shared_expert_adapter_loading(legacy_adapters)
     _load_adapter_state(fresh, loaded)
